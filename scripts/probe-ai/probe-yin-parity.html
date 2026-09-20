@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>YIN 双实现对照 · 真素材</title>
+    <style>
+      body { font: 12px/1.5 ui-monospace, monospace; background: #111; color: #ddd; padding: 12px; }
+      #out { white-space: pre-wrap; }
+    </style>
+  </head>
+  <body>
+    <pre id="out">running…</pre>
+    <script type="module">
+      /*
+       * 项目里有**两套 YIN**，这个探针量化它们的差距：
+       *
+       *   A) wasm `hajimi_detect_pitch`（`wasm/src/yin.rs`）
+       *      —— 导入时写进 `store.detectedPitchHz` 的那个；PSOLA 内部也用它。
+       *      有自相关兜底 + 帧间一致性闸门（2026-09-19 补的）。
+       *
+       *   B) JS `detectPitchYinCore`（`src/engine/pitch.ts`）
+       *      —— 音高面板选「YIN」时走的就是它（经 pitch-worker）。
+       *      **没有**上面那套兜底。
+       *
+       * 拆开看的两条路，所以必须确认它们给用户的结论是否一致。
+       * 触发这次对照的实证：`米.002.mp3` 在面板 YIN 下是 null，而 wasm YIN 给 382.7Hz。
+       */
+      import { detectPitchYinCore } from '../../src/engine/pitch';
+      import { decodeAudioBlob } from '../../src/engine/sample-player';
+
+      const out = document.getElementById('out');
+      const lines = [];
+      const log = (...a) => {
+        const s = a.map((x) => (typeof x === 'string' ? x : JSON.stringify(x))).join(' ');
+        lines.push(s);
+        out.textContent = lines.join('\n');
+        console.log('[probe]', s);
+      };
+      window.__PROBE_LINES__ = lines;
+
+      // ---- wasm（与 scripts/_probe-material-detect.mjs 同一套 ABI）----
+      const bytes = await (await fetch('/hajimi_audio.wasm')).arrayBuffer();
+      const { instance } = await WebAssembly.instantiate(bytes, {
+        env: { __memory_base: 0, __table_base: 0 },
+      });
+      const ex = instance.exports;
+      const mem = ex.memory;
+      const alloc = (n) => ex.hajimi_alloc(n) >>> 0;
+
+      log(
+        `wasm 导出检查: alloc=${typeof ex.hajimi_alloc} decode=${typeof ex.hajimi_decode} ` +
+          `detect=${typeof ex.hajimi_detect_pitch} memory=${mem ? 'ok' : 'MISSING'}`,
+      );
+
+      /** wasm 路径：解码 + hajimi_detect_pitch。失败返回 {err}。 */
+      function wasmYin(ab) {
+        try {
+          const buf = new Uint8Array(ab);
+          const ptr = alloc(buf.length);
+          new Uint8Array(mem.buffer, ptr, buf.length).set(buf);
+          const nch = ex.hajimi_decode(ptr, buf.length) | 0;
+          ex.hajimi_dealloc(ptr, buf.length);
+          if (nch <= 0) return { err: `decode nch=${nch}` };
+          const hz = ex.hajimi_detect_pitch();
+          const frames = ex.hajimi_decode_frames() | 0;
+          const sr = ex.hajimi_decode_sample_rate() | 0;
+          // channel 0 拷出来给 JS YIN 用同一份数据（保证只比算法、不比输入）
+          const cp = ex.hajimi_decode_channel_ptr(0) >>> 0;
+          const ch0 = new Float32Array(mem.buffer, cp, frames).slice();
+          ex.hajimi_decode_free();
+          return { hz, ch0, sr };
+        } catch (e) {
+          return { err: String(e) };
+        }
+      }
+
+      const cents = (a, b) =>
+        a > 0 && b > 0 ? 1200 * Math.log2(a / b) : NaN;
+
+      const FILES = [
+        '北','南.001','南','呀','哈.001','哈.002','哈.003','哈.004','哈.005','哈.006',
+        '哈.007','哈','啊','嘎','基.001','基.002','基.003','基.004','基.005','基',
+        '奶','完整龙','慢哈','慢基','慢米','猫','米.001','米.002','米.003','米.004',
+        '米.005','米','绿','苦','西','豆','高北','高猫','高绿','高豆','龙.001',
+      ].map((n) => n + '.mp3');
+
+      log('=== YIN 双实现对照（41 个真素材）===');
+      log('');
+      log('素材'.padEnd(14), 'wasm'.padStart(9), 'JS'.padStart(9), '  差');
+      log('-'.repeat(46));
+
+      let wasmMiss = 0;
+      let jsMiss = 0;
+      let both = 0;
+      let onlyWasm = 0;
+      let onlyJs = 0;
+      const bigDiff = [];
+
+      for (const f of FILES) {
+        const url = '/' + encodeURIComponent('素材') + '/' + encodeURIComponent(f);
+        let ab;
+        try {
+          const res = await fetch(url);
+          ab = await res.arrayBuffer();
+        } catch (e) {
+          log(`${f}: fetch 失败 ${String(e)}`);
+          continue;
+        }
+        const w = wasmYin(ab);
+        if (w.err || !w.ch0) {
+          log(`${f}: ${w.err ?? 'wasm 无输出'}（bytes=${ab.byteLength}）`);
+          continue;
+        }
+        const jsHz = detectPitchYinCore(w.ch0, w.sr) ?? 0;
+        const wHz = w.hz > 0 ? w.hz : 0;
+
+        if (wHz <= 0) wasmMiss++;
+        if (jsHz <= 0) jsMiss++;
+        if (wHz > 0 && jsHz > 0) {
+          both++;
+          const c = cents(jsHz, wHz);
+          if (Math.abs(c) > 50) bigDiff.push(`${f}(${c.toFixed(0)}¢)`);
+        } else if (wHz > 0) onlyWasm++;
+        else if (jsHz > 0) onlyJs++;
+
+        const d = wHz > 0 && jsHz > 0 ? cents(jsHz, wHz) : NaN;
+        log(
+          f.replace('.mp3', '').padEnd(14),
+          (wHz > 0 ? wHz.toFixed(1) : '未检出').padStart(9),
+          (jsHz > 0 ? jsHz.toFixed(1) : '未检出').padStart(9),
+          Number.isFinite(d) ? `  ${d > 0 ? '+' : ''}${d.toFixed(0)}¢`.padStart(7) : '      --',
+        );
+      }
+
+      log('-'.repeat(46));
+      log('');
+      log(`wasm YIN 未检出 : ${wasmMiss}/41`);
+      log(`JS   YIN 未检出 : ${jsMiss}/41`);
+      log(`两者都有值      : ${both}/41（其中差 >50¢ 的 ${bigDiff.length} 个）`);
+      log(`只有 wasm 有值  : ${onlyWasm}/41   ← 面板选 YIN 时这些素材会显示「未检出」`);
+      log(`只有 JS   有值  : ${onlyJs}/41`);
+      if (bigDiff.length) log(`偏差清单：${bigDiff.join(' ')}`);
+      log('');
+      log('=== DONE ===');
+    </script>
+  </body>
+</html>

@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>YIN 统一验收 · 生产 worker 走 wasm</title>
+    <style>
+      body { font: 12px/1.5 ui-monospace, monospace; background: #111; color: #ddd; padding: 12px; }
+      #out { white-space: pre-wrap; }
+    </style>
+  </head>
+  <body>
+    <pre id="out">running…</pre>
+    <script type="module">
+      /*
+       * 验收「面板 YIN 与导入 YIN 合一份实现」这件事 —— 而且必须走**生产 worker**。
+       *
+       * 为什么不能只跑 probe-yin-parity.html：那个对照的是 `hajimi_detect_pitch`
+       * vs JS `detectPitchYinCore` **两份算法**，证明的是「该统一」；
+       * 本探针证明的是「已经统一了」—— 它把请求发给 `src/engine/pitch-worker.ts`
+       * 本体（跟线上加载的是同一个文件），看它回来的数是不是 wasm 的数。
+       *
+       * 三条口径，同一份输入（channel 0 的前 4 秒，与 pitch-async.ts::sendToWorker 一致）：
+       *   worker  : production worker 的 yin 结果        ← 面板实际拿到的
+       *   yinF32  : wasm `hajimi_yin_f32` 直接调用       ← 期望值（统一后的唯一实现）
+       *   JS      : JS `detectPitchYinCore`              ← 旧面板行为 / 应急退路
+       *
+       * 关键指标：`onlyWasm`（只有 wasm 有值）应当在统一后变成 0 ——
+       * 它正是「导入时有根音、面板里未检出」的那批素材。
+       */
+      import { detectPitchYinCore } from '../../src/engine/pitch';
+
+      const out = document.getElementById('out');
+      const lines = [];
+      const log = (...args) => {
+        const line = args
+          .map((a) => (typeof a === 'string' ? a : JSON.stringify(a)))
+          .join(' ');
+        lines.push(line);
+        out.textContent = lines.join('\n');
+        console.log('[probe]', line);
+      };
+      window.__PROBE_LINES__ = lines;
+
+      window.addEventListener('error', (e) => log('window.onerror: ' + e.message));
+      window.addEventListener('unhandledrejection', (e) =>
+        log('unhandledrejection: ' + String(e.reason)),
+      );
+
+      // ---- wasm（与 probe-yin-parity.html 同一套 ABI）----
+      const bytes = await (await fetch('/hajimi_audio.wasm')).arrayBuffer();
+      const { instance } = await WebAssembly.instantiate(bytes, {
+        env: { __memory_base: 0, __table_base: 0 },
+      });
+      const ex = instance.exports;
+      const mem = ex.memory;
+      const alloc = (n) => ex.hajimi_alloc(n) >>> 0;
+
+      log('=== 环境 ===');
+      log('UA: ' + navigator.userAgent);
+      log(
+        `wasm 导出: yin_f32=${typeof ex.hajimi_yin_f32} detect_pitch=${typeof ex.hajimi_detect_pitch}`,
+      );
+
+      // ---- 生产 worker ----
+      const worker = new Worker(new URL('../../src/engine/pitch-worker.ts', import.meta.url), {
+        type: 'module',
+      });
+      const pending = new Map();
+      let seq = 0;
+      const workerLog = [];
+      worker.onmessage = (e) => {
+        const m = e.data;
+        if (m.type === 'status' || m.type === 'ack') return;
+        const res = pending.get(m.id);
+        if (!res) return;
+        pending.delete(m.id);
+        res(m);
+      };
+      worker.onerror = (e) => log('worker.onerror: ' + (e.message || '?') + ' @' + e.lineno);
+
+      /** 与 pitch-async.ts::sendToWorker 同构：取前 seconds 秒、slice、transfer。 */
+      function askWorker(pcm, sampleRate, seconds) {
+        const maxSamples = Math.min(pcm.length, Math.floor(sampleRate * seconds));
+        const copy = pcm.slice(0, maxSamples);
+        const id = ++seq;
+        return new Promise((res) => {
+          pending.set(id, res);
+          worker.postMessage(
+            { id, detector: 'yin', data: copy.buffer, sampleRate },
+            [copy.buffer],
+          );
+        });
+      }
+
+      const cents = (a, b) => (a > 0 && b > 0 ? 1200 * Math.log2(a / b) : NaN);
+
+      /** 解码：wasm 路径 + 原始 f32 直跑 yin_f32。失败返回 {err}。 */
+      function loadMaterial(ab) {
+        try {
+          const buf = new Uint8Array(ab);
+          const ptr = alloc(buf.length);
+          new Uint8Array(mem.buffer, ptr, buf.length).set(buf);
+          const nch = ex.hajimi_decode(ptr, buf.length) | 0;
+          ex.hajimi_dealloc(ptr, buf.length);
+          if (nch <= 0) return { err: `decode nch=${nch}` };
+          const importHz = ex.hajimi_detect_pitch(); // 导入时写进 store 的那个
+          const frames = ex.hajimi_decode_frames() | 0;
+          const sr = ex.hajimi_decode_sample_rate() | 0;
+          const cp = ex.hajimi_decode_channel_ptr(0) >>> 0;
+          const ch0 = new Float32Array(mem.buffer, cp, frames).slice();
+          ex.hajimi_decode_free();
+
+          // yinF32 直接调用（期望值）
+          const f32 = (() => {
+            if (typeof ex.hajimi_yin_f32 !== 'function') return 0;
+            const p = alloc(ch0.length * 4 + 4);
+            const al = (p + 3) & ~3;
+            new Float32Array(mem.buffer, al, ch0.length).set(ch0);
+            const hz = ex.hajimi_yin_f32(al, ch0.length, sr, 0, 0, 0);
+            ex.hajimi_dealloc(p, ch0.length * 4 + 4);
+            return hz || 0;
+          })();
+
+          return { importHz: importHz || 0, ch0, sr, f32: f32 > 0 ? f32 : 0 };
+        } catch (e) {
+          return { err: String(e) };
+        }
+      }
+
+      const FILES = [
+        '北','南.001','南','呀','哈.001','哈.002','哈.003','哈.004','哈.005','哈.006',
+        '哈.007','哈','啊','嘎','基.001','基.002','基.003','基.004','基.005','基',
+        '奶','完整龙','慢哈','慢基','慢米','猫','米.001','米.002','米.003','米.004',
+        '米.005','米','绿','苦','西','豆','高北','高猫','高绿','高豆','龙.001',
+      ].map((n) => n + '.mp3');
+
+      log('');
+      log('=== 三条口径对照（channel 0 前 4 秒，41 个真素材）===');
+      log('');
+      log(
+        '素材'.padEnd(13),
+        'worker'.padStart(9),
+        'yinF32'.padStart(9),
+        'JS'.padStart(9),
+        '  w-期望',
+      );
+      log('-'.repeat(52));
+
+      let workerMiss = 0;
+      let f32Miss = 0;
+      let jsMiss = 0;
+      const disagree = [];
+      let onlyWasmFixed = 0; // 旧面板会显示未检出、现在有值
+      let regressed = 0; // 旧面板有值、现在没有（不应该出现）
+      let n = 0;
+
+      for (const f of FILES) {
+        const url = '/' + encodeURIComponent('素材') + '/' + encodeURIComponent(f);
+        let ab;
+        try {
+          ab = await (await fetch(url)).arrayBuffer();
+        } catch (e) {
+          log(`${f}: fetch 失败 ${String(e)}`);
+          continue;
+        }
+        const m = loadMaterial(ab);
+        if (m.err) {
+          log(`${f}: ${m.err}（bytes=${ab.byteLength}）`);
+          continue;
+        }
+        n++;
+
+        const res = await askWorker(m.ch0, m.sr, 4);
+        const workerHz = 'error' in res ? 0 : (res.hz ?? 0);
+        const jsHz = detectPitchYinCore(m.ch0.slice(0, m.sr * 4), m.sr) ?? 0;
+
+        if (workerHz <= 0) workerMiss++;
+        if (m.f32 <= 0) f32Miss++;
+        if (jsHz <= 0) jsMiss++;
+
+        const d = workerHz > 0 && m.f32 > 0 ? cents(workerHz, m.f32) : NaN;
+        if ('error' in res) disagree.push(`${f}(err)`);
+        else if (workerHz > 0 !== m.f32 > 0) disagree.push(`${f}(有无不一致)`);
+        else if (Math.abs(d) > 1) disagree.push(`${f}(${d.toFixed(1)}¢)`);
+
+        if (jsHz <= 0 && m.f32 > 0) onlyWasmFixed++;
+        if (jsHz > 0 && m.f32 <= 0) regressed++;
+
+        log(
+          f.replace('.mp3', '').padEnd(13),
+          (workerHz > 0 ? workerHz.toFixed(1) : '未检出').padStart(9),
+          (m.f32 > 0 ? m.f32.toFixed(1) : '未检出').padStart(9),
+          (jsHz > 0 ? jsHz.toFixed(1) : '未检出').padStart(9),
+          Number.isFinite(d) ? `  ${d > 0 ? '+' : ''}${d.toFixed(1)}¢`.padStart(7) : '     --',
+        );
+      }
+
+      log('-'.repeat(52));
+      log('');
+      log(`样本              : ${n}/41`);
+      log(`worker 未检出     : ${workerMiss}/${n}   ← 面板（统一后）`);
+      log(`JS     未检出     : ${jsMiss}/${n}   ← 面板（统一前）`);
+      log(`yinF32 未检出     : ${f32Miss}/${n}`);
+      log(`worker vs yinF32  : 分歧 ${disagree.length} 个 ${disagree.join(' ')}`);
+      log(`旧面板漏检被修复  : ${onlyWasmFixed} 个  ← 导入有根音、旧面板「未检出」的素材`);
+      log(`回归（JS 有、wasm 无）: ${regressed} 个`);
+      log('');
+      log(
+        disagree.length === 0 && regressed === 0
+          ? 'RESULT: PASS —— 面板 YIN 与 wasm YIN 已是同一份实现'
+          : 'RESULT: FAIL —— 见上面分歧清单',
+      );
+      log('=== DONE ===');
+      worker.terminate();
+    </script>
+  </body>
+</html>

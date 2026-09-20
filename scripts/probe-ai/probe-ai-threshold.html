@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>AI 弃权诊断 · 阈值扫描</title>
+    <style>
+      body { font: 12px/1.5 ui-monospace, monospace; background: #111; color: #ddd; padding: 12px; }
+      #out { white-space: pre-wrap; }
+    </style>
+  </head>
+  <body>
+    <pre id="out">running…</pre>
+    <script type="module">
+      /*
+       * 目的：搞清楚 AI「弃权」（给不出任何音符）**卡在哪一步**，而不是猜。
+       *
+       * `evaluateModel` 会同时吐出 frames / onsets / contours 三份逐帧概率图，
+       * 弃权只可能发生在后两步：
+       *   ① frames 为空          → 模型根本没输出（输入太短/后端问题）
+       *   ② onsets 全程低于阈值  → 有音高但没"起音"，`outputToNotesPoly` 不给音符
+       *   ③ 有 onset 但时长短于 minNoteLength → 被最短时长滤掉
+       *
+       * 关键设计：**推理只跑一次**，之后不同阈值只是重跑 `outputToNotesPoly`
+       * （纯 JS，毫秒级）。否则 41 个素材 × 4 组阈值 = 4 倍推理时间，白等。
+       *
+       * 读法：看每个素材在 0.25 / 0.15 / 0.10 / 0.05 下出不出结果、结果与 YIN
+       * 差多少。若"现用阈值弃权、放宽后出结果且与 YIN 一致"，那阈值就是瓶颈；
+       * 若放宽后结果与 YIN 差得很远，那模型本来就不知道，不该改阈值。
+       */
+      import { cacheBuffer, decodeAudioBlob } from '../../src/engine/sample-player';
+      import { AI_SECONDS, AI_TARGET_SR, centsBetween } from '../../src/engine/pitch-ai-budget';
+      import { candidateWindows } from '../../src/engine/pitch-window';
+      import { getSamplePitchHzDetailed } from '../../src/engine/pitch-async';
+
+      const out = document.getElementById('out');
+      const lines = [];
+      const log = (...args) => {
+        const line = args
+          .map((a) => (typeof a === 'string' ? a : JSON.stringify(a)))
+          .join(' ');
+        lines.push(line);
+        out.textContent = lines.join('\n');
+        console.log('[probe]', line);
+      };
+      window.__PROBE_LINES__ = lines;
+      window.addEventListener('error', (e) => log('window.onerror: ' + e.message));
+      window.addEventListener('unhandledrejection', (e) =>
+        log('unhandledrejection: ' + String(e.reason)),
+      );
+
+      const FILES = [
+        '北','南.001','南','呀','哈.001','哈.002','哈.003','哈.004','哈.005','哈.006',
+        '哈.007','哈','啊','嘎','基.001','基.002','基.003','基.004','基.005','基',
+        '奶','完整龙','慢哈','慢基','慢米','猫','米.001','米.002','米.003','米.004',
+        '米.005','米','绿','苦','西','豆','高北','高猫','高绿','高豆','龙.001',
+      ].map((n) => n + '.mp3');
+
+      // ---- basic-pitch（与 pitch-worker.ts::inferWindow 同一调用方式）----
+      const bp = await import('@spotify/basic-pitch');
+      log('加载模型…');
+      const model = new bp.BasicPitch('/model.json');
+      await model.model;
+      log('模型就绪');
+
+      const resample = (input, fromSr) => {
+        if (fromSr === AI_TARGET_SR) return input;
+        const ratio = fromSr / AI_TARGET_SR;
+        const outLen = Math.floor(input.length / ratio);
+        const o = new Float32Array(outLen);
+        for (let i = 0; i < outLen; i++) {
+          const src = i * ratio;
+          const i0 = Math.floor(src);
+          const i1 = Math.min(i0 + 1, input.length - 1);
+          const t = src - i0;
+          o[i] = input[i0] * (1 - t) + input[i1] * t;
+        }
+        return o;
+      };
+
+      /** 跑一次推理，返回三份概率图。 */
+      async function infer(pcm, sr) {
+        const frames = [];
+        const onsets = [];
+        const contours = [];
+        await model.evaluateModel(
+          resample(pcm, sr),
+          (f, o, c) => {
+            for (const x of f) frames.push(x);
+            for (const x of o) onsets.push(x);
+            for (const x of c) contours.push(x);
+          },
+          () => {},
+        );
+        return { frames, onsets, contours };
+      }
+
+      const maxOf = (grid) => {
+        let m = 0;
+        for (const row of grid) for (const v of row) if (v > m) m = v;
+        return m;
+      };
+
+      /** 用给定阈值把概率图转成音高（复刻 inferWindow 的后半段）。 */
+      function notesHz(grids, mod, onsetT, frameT, minLen) {
+        const notes = mod.noteFramesToTime(
+          mod.addPitchBendsToNoteEvents(
+            grids.contours,
+            mod.outputToNotesPoly(grids.frames, grids.onsets, onsetT, frameT, minLen),
+          ),
+        );
+        if (notes.length === 0) return null;
+        let best = notes[0];
+        for (const n of notes) if ((n.amplitude ?? 0) > (best.amplitude ?? 0)) best = n;
+        return 440 * Math.pow(2, (best.pitchMidi - 69) / 12);
+      }
+
+      const GRID = [
+        [0.25, 0.25, 5], // 现用（库默认）
+        [0.22, 0.22, 5],
+        [0.2, 0.2, 4],
+        [0.15, 0.15, 5],
+        [0.15, 0.15, 3],
+        [0.1, 0.1, 3],
+      ];
+
+      let frameEmpty = 0;
+      let onsetLow = 0;
+      const recovered = [];
+      const lost = [];
+
+      for (const f of FILES) {
+        const url = '/' + encodeURIComponent('素材') + '/' + encodeURIComponent(f);
+        let buf;
+        try {
+          const blob = await (await fetch(url)).blob();
+          buf = await decodeAudioBlob(blob);
+        } catch (err) {
+          log(`${f}: 解码失败 ${String(err)}`);
+          continue;
+        }
+        cacheBuffer(f, buf);
+        const sr = buf.sampleRate;
+        const ch0 = buf.getChannelData(0).slice(0, Math.floor(sr * 4));
+        const win = candidateWindows(ch0, sr, AI_SECONDS, 1)[0];
+        const yin = (await getSamplePitchHzDetailed(f, 'yin')).hz;
+
+        const grids = await infer(win, sr);
+        const fMax = maxOf(grids.frames);
+        const oMax = maxOf(grids.onsets);
+
+        const cells = GRID.map(([ot, ft, ml]) => notesHz(grids, bp, ot, ft, ml));
+        const base = cells[0];
+        if (grids.frames.length === 0) frameEmpty++;
+        else if (base == null) onsetLow++;
+
+        if (base == null && cells.some((h) => h != null)) recovered.push(f);
+        if (base != null && cells.some((h) => h == null)) lost.push(f);
+
+        log(
+          `${f.replace('.mp3', '').padEnd(10)}` +
+            ` ${String(grids.frames.length).padStart(2)}帧` +
+            ` fnMax ${fMax.toFixed(2)}` +
+            ` onMax ${oMax.toFixed(2)}` +
+            ` | YIN ${(yin == null ? 'null' : yin.toFixed(1)).padStart(8)}` +
+            ` | ` +
+            GRID.map(([ot], i) => {
+              const h = cells[i];
+              if (h == null) return `${ot}:--`.padStart(11);
+              const c = yin != null ? centsBetween(h, yin) : NaN;
+              return `${ot}:${h.toFixed(1)}${Number.isFinite(c) ? `(${c > 0 ? '+' : ''}${c.toFixed(0)})` : ''}`.padStart(
+                11,
+              );
+            }).join(' '),
+        );
+      }
+
+      log('');
+      log(`frames 为空（模型没输出）: ${frameEmpty}/41`);
+      log(`现用阈值弃权但 frames 有数据: ${onsetLow}/41   ← 阈值/最短时长的嫌疑区`);
+      log(`放宽后新召回: ${recovered.length} ${recovered.join(' ')}`);
+      log(`放宽后反而丢结果: ${lost.length} ${lost.join(' ')}`);
+      log('=== DONE ===');
+    </script>
+  </body>
+</html>

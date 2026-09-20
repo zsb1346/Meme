@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>AI 音高检测 · 生产 worker 真浏览器探针</title>
+    <style>
+      body { font: 12px/1.5 ui-monospace, monospace; background: #111; color: #ddd; padding: 12px; }
+      #out { white-space: pre-wrap; }
+    </style>
+  </head>
+  <body>
+    <pre id="out">running…</pre>
+    <script type="module">
+      /*
+       * 与 probe-ai.html 的区别：那个测的是**探针副本** worker，
+       * 这个直接加载 `src/engine/pitch-worker.ts` —— 也就是真正上线的那份。
+       * 探针副本可以回报后端/阶段耗时，但副本通过不代表线上通过，所以两份都要跑。
+       *
+       * 主线程这一侧的计时就是 `pitch-async.ts` 看到的那个数，所以这里报的 ms
+       * 可以直接和 `PITCH_TIMEOUT_MS.ai` 比。预算常量直接 import 真实模块，
+       * 不在探针里抄一份 —— 抄一份就会和线上漂移（当年 15000 与 4 秒输入不一致
+       * 正是这种漂移造成的）。
+       */
+      import {
+        AI_SECONDS,
+        PITCH_ACK_WATCHDOG_MS,
+        PITCH_TIMEOUT_MS,
+        aiBatchCount,
+      } from '../../src/engine/pitch-ai-budget';
+
+      const out = document.getElementById('out');
+      const lines = [];
+      const log = (...args) => {
+        const line = args
+          .map((a) => (typeof a === 'string' ? a : JSON.stringify(a)))
+          .join(' ');
+        lines.push(line);
+        out.textContent = lines.join('\n');
+        console.log('[probe]', line);
+      };
+      window.__PROBE_LINES__ = lines;
+
+      window.addEventListener('error', (e) => log('window.onerror: ' + e.message));
+      window.addEventListener('unhandledrejection', (e) =>
+        log('unhandledrejection: ' + String(e.reason)),
+      );
+
+      const worker = new Worker(new URL('../../src/engine/pitch-worker.ts', import.meta.url), {
+        type: 'module',
+      });
+      const pending = new Map();
+      const t0s = new Map();
+      let seq = 0;
+
+      worker.onmessage = (e) => {
+        const m = e.data;
+        // 与 pitch-async.ts 的分流一致：status / ack 都不是结果。
+        // 漏了 ack 这条会让它被当成 hz=undefined 的结果（耗时 0ms、音高 null）。
+        if (m.type === 'status') {
+          log(`[status] ${m.status}${m.backend ? ' backend=' + m.backend : ''}`);
+          return;
+        }
+        if (m.type === 'ack') {
+          log(`[ack] id=${m.id}（worker 开始处理，主线程从这里才起算超时）`);
+          return;
+        }
+        const entry = pending.get(m.id);
+        if (!entry) return;
+        pending.delete(m.id);
+        const ms = Date.now() - t0s.get(m.id);
+        t0s.delete(m.id);
+        // 注意：Promise 的 resolve 只能带一个值，所以要包成对象再解构。
+        entry({ ms, m });
+      };
+      worker.onerror = (e) => {
+        log('worker.onerror: ' + (e.message || '?') + ' @ ' + e.filename + ':' + e.lineno);
+      };
+
+      /** 与 pitch-async.ts::sendToWorker 逐行同构：取前 N 秒、slice 拷贝、transfer。 */
+      function send(pcm, sampleRate, seconds) {
+        const maxSamples = Math.min(pcm.length, Math.floor(sampleRate * seconds));
+        const copy = pcm.slice(0, maxSamples);
+        const id = ++seq;
+        const p = new Promise((res) => pending.set(id, res));
+        t0s.set(id, Date.now());
+        worker.postMessage({ id, detector: 'ai', data: copy.buffer, sampleRate }, [copy.buffer]);
+        return p;
+      }
+
+      function sine(hz, sec, sr) {
+        const n = Math.round(sr * sec);
+        const x = new Float32Array(n);
+        for (let i = 0; i < n; i++) x[i] = 0.5 * Math.sin((2 * Math.PI * hz * i) / sr);
+        return x;
+      }
+
+      const TIMEOUT_MS = PITCH_TIMEOUT_MS.ai;
+
+      log('=== 环境 ===');
+      log('UA: ' + navigator.userAgent);
+      log(`跨域隔离: ${self.crossOriginIsolated}  OffscreenCanvas: ${typeof OffscreenCanvas}`);
+      log(
+        `预算: worker 只吃 AI_SECONDS=${AI_SECONDS}s（= ${aiBatchCount(AI_SECONDS)} 批）；` +
+          `超时 ai=${PITCH_TIMEOUT_MS.ai}ms / yin=${PITCH_TIMEOUT_MS.yin}ms；ack 看门狗=${PITCH_ACK_WATCHDOG_MS}ms`,
+      );
+      log(
+        '（主线程传多少秒都不影响批数 —— 传输长度由 sendToWorker 给到 4s，' +
+          'worker 会挑最响的 AI_SECONDS 秒来跑）',
+      );
+
+      async function run(label, pcm, sr, seconds) {
+        log(`--- ${label}（输入 ${seconds}s @${sr}）---`);
+        const { ms, m } = await send(pcm, sr, seconds);
+        if ('error' in m) {
+          log(`  失败 ${ms}ms: ${m.error}`);
+          return;
+        }
+        const hz = m.hz;
+        log(`  ${ms}ms  →  ${hz == null ? 'null' : hz.toFixed(1) + ' Hz'}  ${ms > TIMEOUT_MS ? 'NG 超过超时 → UI 会显示「未检出音高」' : 'OK 在超时内'}`);
+      }
+
+      // 用例 1/2：免重采样路径（22050）—— 隔离出「纯推理」成本
+      await run('220Hz / 免重采样 / 4s', sine(220, 4, 22050), 22050, 4);
+      // 用例 3/4：真实路径（素材是 48k，要走线性重采样）
+      await run('220Hz / 需重采样 / 4s', sine(220, 4, 48000), 48000, 4);
+      await run('220Hz / 需重采样 / 1s', sine(220, 4, 48000), 48000, 1);
+
+      log('=== DONE ===');
+    </script>
+  </body>
+</html>

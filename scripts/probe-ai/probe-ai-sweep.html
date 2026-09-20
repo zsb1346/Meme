@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>AI 音高检测 · 41 素材全量扫（弃权率）</title>
+    <style>
+      body { font: 12px/1.5 ui-monospace, monospace; background: #111; color: #ddd; padding: 12px; }
+      #out { white-space: pre-wrap; }
+    </style>
+  </head>
+  <body>
+    <pre id="out">running…</pre>
+    <script type="module">
+      /*
+       * 为什么要把 41 个素材全跑一遍 AI：probe-ai-e2e.html 只挑了 6 个已知分歧样本，
+       * 它的结论是「降级链对不对」。但要决定「AI 还要不要再加固」，需要的是
+       * **弃权率**这个基数 —— 即：走完整策略链之后，有多少素材 AI 给不出结果、
+       * 只能靠 YIN 兜。这个数决定后续要不要给 AI 加「换一个窗口重试」。
+       *
+       * 每行给出：
+       *   请求AI→ AI   = AI 结果被采纳
+       *   请求AI→ YIN  = AI 弃权 / 硬失败 / 错八度 → 采用 YIN（fellBack）
+       *   请求AI→ YIN(null) = AI 和 YIN 都没结果（素材确实无音高）
+       */
+      import { cacheBuffer, decodeAudioBlob } from '../../src/engine/sample-player';
+      import { getSamplePitchHzDetailed } from '../../src/engine/pitch-async';
+      import {
+        AI_SECONDS,
+        PITCH_TIMEOUT_MS,
+        centsBetween,
+      } from '../../src/engine/pitch-ai-budget';
+      import { candidateWindows } from '../../src/engine/pitch-window';
+
+      const out = document.getElementById('out');
+      const lines = [];
+      const log = (...args) => {
+        const line = args
+          .map((a) => (typeof a === 'string' ? a : JSON.stringify(a)))
+          .join(' ');
+        lines.push(line);
+        out.textContent = lines.join('\n');
+        console.log('[probe]', line);
+      };
+      window.__PROBE_LINES__ = lines;
+      window.addEventListener('error', (e) => log('window.onerror: ' + e.message));
+      window.addEventListener('unhandledrejection', (e) =>
+        log('unhandledrejection: ' + String(e.reason)),
+      );
+
+      const FILES = [
+        '北','南.001','南','呀','哈.001','哈.002','哈.003','哈.004','哈.005','哈.006',
+        '哈.007','哈','啊','嘎','基.001','基.002','基.003','基.004','基.005','基',
+        '奶','完整龙','慢哈','慢基','慢米','猫','米.001','米.002','米.003','米.004',
+        '米.005','米','绿','苦','西','豆','高北','高猫','高绿','高豆','龙.001',
+      ].map((n) => n + '.mp3');
+
+      const fmt = (r) => (r.hz == null ? 'null' : `${r.hz.toFixed(1)}Hz`);
+
+      log('=== 环境 ===');
+      log(`UA: ${navigator.userAgent}`);
+      log(`预算 ai=${PITCH_TIMEOUT_MS.ai}ms / yin=${PITCH_TIMEOUT_MS.yin}ms`);
+      log('');
+
+      let adopted = 0;
+      let fellBack = 0;
+      let bothNull = 0;
+      let overBudget = 0;
+      let n = 0;
+      const fallbackList = [];
+      const msList = [];
+
+      for (const f of FILES) {
+        const url = '/' + encodeURIComponent('素材') + '/' + encodeURIComponent(f);
+        let buf;
+        try {
+          const blob = await (await fetch(url)).blob();
+          buf = await decodeAudioBlob(blob);
+        } catch (err) {
+          log(`${f}: 取素材/解码失败 ${String(err)}`);
+          continue;
+        }
+        cacheBuffer(f, buf);
+        n++;
+
+        // worker 实际看到的输入：channel 0 的前 4 秒（与 pitch-async 一致）
+        const ch0 = buf.getChannelData(0).slice(0, Math.floor(buf.sampleRate * 4));
+        const winCount = candidateWindows(ch0, buf.sampleRate, AI_SECONDS, 3).length;
+
+        const yin = await getSamplePitchHzDetailed(f, 'yin');
+        const t = performance.now();
+        const ai = await getSamplePitchHzDetailed(f, 'ai');
+        const ms = performance.now() - t;
+        msList.push(ms);
+
+        const cents = yin.hz != null && ai.hz != null ? centsBetween(ai.hz, yin.hz) : null;
+        const isFallback = ai.detector === 'yin';
+        if (ai.hz == null) bothNull++;
+        else if (isFallback) {
+          fellBack++;
+          fallbackList.push(`${f.replace('.mp3', '')}(YIN ${fmt(yin)})`);
+        } else adopted++;
+        if (ms > PITCH_TIMEOUT_MS.ai) overBudget++;
+
+        log(
+          `${f.replace('.mp3', '').padEnd(10)}` +
+            ` ${(buf.duration * 1000).toFixed(0).padStart(4)}ms` +
+            ` 窗口${String(winCount).padStart(2)}` +
+            ` YIN ${fmt(yin).padStart(9)}` +
+            ` → AI${ai.detector === 'ai' ? 'OK' : 'NG'} ${fmt(ai).padStart(9)}` +
+            ` ${ms.toFixed(0).padStart(5)}ms` +
+            (cents != null ? `  差${cents.toFixed(0).padStart(6)}¢` : '        --'),
+        );
+      }
+
+      msList.sort((a, b) => a - b);
+      const p50 = msList[Math.floor(msList.length / 2)] ?? 0;
+      const max = msList[msList.length - 1] ?? 0;
+
+      log('');
+      log(`样本            : ${n}/${FILES.length}`);
+      log(`AI 被采纳        : ${adopted}`);
+      log(`AI 弃权/被否 → YIN: ${fellBack}`);
+      log(`AI、YIN 都 null   : ${bothNull}（素材本身无音高）`);
+      log(`超过 AI 预算      : ${overBudget}`);
+      log(`单次耗时 p50/max  : ${p50.toFixed(0)}ms / ${max.toFixed(0)}ms`);
+      if (fallbackList.length) log(`兜底清单：${fallbackList.join(' ')}`);
+      log('');
+      log(
+        fellBack + bothNull === 0
+          ? 'RESULT: PASS —— AI 全量给出结果'
+          : `RESULT: 有 ${fellBack + bothNull} 个素材没吃到 AI 结果（这是加固前的基线）`,
+      );
+      log('=== DONE ===');
+    </script>
+  </body>
+</html>

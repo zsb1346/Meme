@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>AI 音高检测 · 真素材端到端探针</title>
+    <style>
+      body { font: 12px/1.5 ui-monospace, monospace; background: #111; color: #ddd; padding: 12px; }
+      #out { white-space: pre-wrap; }
+    </style>
+  </head>
+  <body>
+    <pre id="out">running…</pre>
+    <script type="module">
+      /*
+       * 端到端：真素材 → decodeAudioBlob → cacheBuffer → getSamplePitchHzDetailed
+       *        → pitch-async（超时/兜底/交叉校验）→ pitch-worker → basic-pitch
+       *
+       * 与 probe-real-worker.html 的分工：那个测 worker 单点（协议、耗时、后端），
+       * 这个测**主线程那一侧的策略**（AI 失败/弃权/错八度时怎么收场）。
+       *
+       * 素材是刻意挑的 —— 覆盖实测里三类分歧：
+       *   豆.mp3     AI 错一个八度（698.5Hz vs YIN 360Hz）→ 应当被交叉校验拦下、采用 YIN
+       *   米.002.mp3 AI 给出不可能的低音（73.4Hz vs YIN 382.7Hz）→ 同上
+       *   完整龙.mp3 两者一致 → 应当直接用 AI
+       *   绿.mp3 / 基.mp3  YIN 检不出（素材只有 ~150ms，YIN 的 43ms 窗放不下几帧）
+       *                   → AI 在放宽档下给出值就该采纳（AI 是更强的检测器，
+       *                     「YIN 漏检」不等于「没有音高」）。
+       *                   注意这两条在加阈值兜底**之前**是返回 null 的，
+       *                   注释已按实测更新（见 AI_NOTES_RELAXED）。
+       */
+      import { cacheBuffer, decodeAudioBlob } from '../../src/engine/sample-player';
+      import { getSamplePitchHzDetailed } from '../../src/engine/pitch-async';
+      import { PITCH_TIMEOUT_MS, centsBetween } from '../../src/engine/pitch-ai-budget';
+
+      const out = document.getElementById('out');
+      const lines = [];
+      const log = (...args) => {
+        const line = args
+          .map((a) => (typeof a === 'string' ? a : JSON.stringify(a)))
+          .join(' ');
+        lines.push(line);
+        out.textContent = lines.join('\n');
+        console.log('[probe]', line);
+      };
+      window.__PROBE_LINES__ = lines;
+      window.addEventListener('error', (e) => log('window.onerror: ' + e.message));
+      window.addEventListener('unhandledrejection', (e) =>
+        log('unhandledrejection: ' + String(e.reason)),
+      );
+
+      const FILES = ['豆.mp3', '米.002.mp3', '完整龙.mp3', '西.mp3', '绿.mp3', '基.mp3'];
+      const fmt = (r) => (r.hz == null ? 'null' : `${r.hz.toFixed(1)}Hz`);
+
+      log('=== 环境 ===');
+      log(`预算 ai=${PITCH_TIMEOUT_MS.ai}ms / yin=${PITCH_TIMEOUT_MS.yin}ms`);
+      log('');
+
+      for (const f of FILES) {
+        const url = '/' + encodeURIComponent('素材') + '/' + encodeURIComponent(f);
+        let buf;
+        try {
+          const blob = await (await fetch(url)).blob();
+          buf = await decodeAudioBlob(blob);
+        } catch (err) {
+          log(`${f}: 取素材/解码失败 ${String(err)}`);
+          continue;
+        }
+        cacheBuffer(f, buf);
+
+        const t1 = performance.now();
+        const yin = await getSamplePitchHzDetailed(f, 'yin');
+        const ms1 = performance.now() - t1;
+
+        const t2 = performance.now();
+        const ai = await getSamplePitchHzDetailed(f, 'ai');
+        const ms2 = performance.now() - t2;
+
+        const cents =
+          yin.hz != null && ai.hz != null ? centsBetween(ai.hz, yin.hz) : null;
+        const fellBack = ai.detector === 'yin';
+
+        log(
+          `${f.padEnd(12)} ${(buf.duration * 1000).toFixed(0).padStart(4)}ms  ` +
+            `YIN ${fmt(yin).padStart(9)} (${ms1.toFixed(0)}ms)   ` +
+            `请求AI→ ${ai.detector.toUpperCase().padEnd(3)} ${fmt(ai).padStart(9)} (${ms2.toFixed(0)}ms)`,
+        );
+        log(
+          `              AI 结果${fellBack ? '被否决，采用 YIN' : '被采纳'}` +
+            (cents != null ? `；两者差 ${cents.toFixed(0)}¢` : '；无可比值') +
+            (ms2 > PITCH_TIMEOUT_MS.ai ? '  ✘ 超过 AI 预算' : ''),
+        );
+      }
+
+      log('');
+      log('=== DONE ===');
+    </script>
+  </body>
+</html>

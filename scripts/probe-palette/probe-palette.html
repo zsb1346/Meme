@@ -1,0 +1,940 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>probe · NotePalette 拼音搜索 + 双保险选中</title>
+    <!--
+      交互探针：把**真实的** NotePalette 组件挂在一个假 take / 假素材上，
+      用 CDP 驱动真实的键盘与鼠标事件，观察
+        ① 拼音/首字母搜索是否命中；
+        ② 「第一次回车只选中、第二次回车才确认」是否成立；
+        ③ 鼠标单击是否整行变色（且与悬停高亮不同色）；
+        ④ 悬停是否会改变提交目标（应当**不会**）；
+        ⑤ **变调 / 拉伸 / 试听的目标是否正确** ——
+           目标 = 已选中行 ?? 这条音符**本来就装着的**素材（用 `?eff=` 切换两种情形）；
+           只有两者都为空时才拦下并提示「还没有选择素材 请按Enter选择素材」，
+           且数值不动。
+      跑法：node scripts/_probe-palette.mjs
+    -->
+    <style>
+      html, body { margin: 0; background: #0e0e10; }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module">
+      import { createElement as h, useState } from 'react';
+      import { createRoot } from 'react-dom/client';
+      import NotePalette from '/src/components/fill/NotePalette.tsx';
+      import { useToastStore } from '/src/components/ui/toast';
+      import * as ext from '/src/engine/external-shift';
+      import * as sp from '/src/engine/sample-player';
+      import * as core from '/src/engine/core';
+      import * as pa from '/src/engine/pitch-async';
+      import * as pitch from '/src/engine/pitch';
+      import { ensureRushLoaded, isRushReady } from '/src/engine/rush/transform';
+      import '/src/index.css';
+
+      /* ── 假素材：用户的验收用例原样 + 一些干扰项 ── */
+      const SAMPLES = [
+        { id: 'p1', name: '张三.mp3', durationSec: 1.0, detectedPitchHz: 220, manualSemitoneOffset: 0, createdAtMs: 1 },
+        { id: 'p2', name: '李四.mp3', durationSec: 1.2, detectedPitchHz: 247, manualSemitoneOffset: 0, createdAtMs: 2 },
+        { id: 'p3', name: '张三丰.mp3', durationSec: 0.9, detectedPitchHz: 262, manualSemitoneOffset: 0, createdAtMs: 3 },
+        { id: 'p4', name: '哈吉米.mp3', durationSec: 0.8, detectedPitchHz: 330, manualSemitoneOffset: 0, createdAtMs: 4 },
+        { id: 'p5', name: '重庆.002.mp3', durationSec: 1.4, detectedPitchHz: 196, manualSemitoneOffset: 0, createdAtMs: 5 },
+      ];
+
+      const TAKE = {
+        id: 'take-probe',
+        name: 'probe',
+        events: [{ keyIndex: 0, pressCount: 1, tSec: 0.4, pitch: 60 }],
+        durationSec: 1.2,
+        createdAtMs: 1,
+      };
+
+      /*
+        ── `?eff=` 决定这个音符**打开面板时是否已经装配了素材** ──
+
+        这正是第 6 节要分开验的两种情形（2026-09-20 用户实报）：
+          · `eff=p1`（默认）—— 已经装好素材 → 调音应当**直接可用**，不必先按 Enter；
+          · `eff=none`      —— 还没装素材     → 才该拦下并提示「还没有选择素材」。
+
+        没有这个开关就只能在同一个探针里钉住其中一种，另一种永远测不到。
+      */
+      const EFF_ARG = new URLSearchParams(location.search).get('eff') ?? 'p1';
+      const EFFECTIVE_SAMPLE_ID = EFF_ARG === 'none' ? null : EFF_ARG;
+
+      /*
+        ══ 「音高 worker 起不来」这一幕的复现器（`?npw=1`）══
+
+        用户实报：面板里报「音高 worker 异常退出」，同一份日志里还有一串
+        `net::ERR_CONNECTION_REFUSED` —— 真因是**本地 dev server 已经退出**，
+        而 worker 的脚本正是从它那儿加载的。
+
+        这一幕**没法靠「把 dev server 关掉」来测**：页面本身也是它发的，
+        关掉之后探针连页面都打不开。所以在页面内把 `Worker` 换成会失败的桩。
+
+        ⚠️ 两个必须做对的地方 —— 做错了会拿到一次「假绿」，实测已经踩过一次：
+
+        ① **必须在 `createRoot(...).render()` 之前安装**（就是本文件下面那行）。
+           从驱动里事后 `ev('__breakWorker(true)')` 是**没用**的：那之前
+           worker 已经被建出来了，而**已经活着的 worker 不会因为 server 退出就死**
+           （它加载的模块早就在内存里）。于是后续请求全部命中那个活 worker，
+           「worker 起不来」这一幕根本没被测到 —— 而接口全绿。
+           实测就是这么骗过一次的：`spawns=0 / status=ready / kind=undefined`，
+           三项都「正常」，因为压根没走到那条路。
+        ② **只拦音高 worker，别拦音频解码 worker**：`sample-player.ts` 也 `new Worker`
+           （`audio-worker.ts`）。一刀切拦掉会让整个装配面板解不出音频 ——
+           那是「把无关的东西弄坏」换来的通过。
+
+        桩 fire 的是一个**四个字段全空**的 ErrorEvent —— 这正是「脚本拿不到」时
+        浏览器给的形态，逼着 `classifyWorkerFailure` 走「零线索」那一支。
+      */
+      const NPW_ARG = new URLSearchParams(location.search).get('npw') === '1';
+      const REAL_WORKER = window.Worker;
+      window.__workerSpawnCount = 0;
+      window.__breakWorker = (on) => {
+        if (on) {
+          window.__workerSpawnCount = 0;
+          window.Worker = class {
+            constructor(url, opts) {
+              const u = String(url);
+              if (!u.includes('pitch-worker')) return new REAL_WORKER(url, opts);
+              window.__workerSpawnCount++;
+              this.postMessage = () => {};
+              this.terminate = () => {};
+              // 下一个 tick 才 fire：`new Worker()` 返回之后才轮到 `w.onerror = …` 那条赋值
+              setTimeout(() => {
+                if (typeof this.onerror === 'function') {
+                  this.onerror({ message: '', filename: '', lineno: 0, colno: 0 });
+                }
+              }, 0);
+            }
+          };
+          return true;
+        }
+        window.Worker = REAL_WORKER;
+        return true;
+      };
+      window.__workerSpawns = () => window.__workerSpawnCount;
+      if (NPW_ARG) window.__breakWorker(true);
+
+      window.__commits = [];
+      window.__closes = 0;
+
+      function Root() {
+        const [open, setOpen] = useState(true);
+        return h(NotePalette, {
+          open,
+          take: TAKE,
+          eventIndex: 0,
+          samples: SAMPLES,
+          effectiveSampleId: EFFECTIVE_SAMPLE_ID,
+          initialDelta: 0,
+          initialTau: 1,
+          onClose: () => {
+            window.__closes += 1;
+            setOpen(false);
+          },
+          onCommit: (...args) => {
+            window.__commits.push(args);
+          },
+        });
+      }
+
+      createRoot(document.getElementById('root')).render(h(Root));
+
+      /* ── 给驱动脚本用的观测口（读的是真实 DOM 与计算样式）── */
+      window.__rows = () =>
+        [...document.querySelectorAll('[role="option"]')].map((el) => {
+          const cs = getComputedStyle(el);
+          const rect = el.getBoundingClientRect();
+          return {
+            name: el.querySelector('span')?.textContent ?? '',
+            selected: el.getAttribute('aria-selected'),
+            cursor: el.getAttribute('data-cursor') ?? null,
+            bg: cs.backgroundColor,
+            color: cs.color,
+            weight: cs.fontWeight,
+            cx: Math.round(rect.left + rect.width / 2),
+            cy: Math.round(rect.top + rect.height / 2),
+          };
+        });
+
+      window.__footerText = () => {
+        const footer = document.querySelector('[role="dialog"]')?.querySelectorAll('span');
+        return [...(footer ?? [])].map((s) => s.textContent).join(' | ');
+      };
+
+      window.__search = (text) => {
+        const input = document.querySelector('input[aria-label="搜索素材"]');
+        input.focus();
+        return document.activeElement === input;
+      };
+
+      /*
+        ── toast 观测口 ──
+        断言「按下去有提示」不能靠翻 DOM：toast 2400ms 就消失了，
+        探针只要慢半拍就漏读。所以**订阅 store 把每条都记进日志**（累加、不清空），
+        驱动脚本事后翻日志即可，与时机无关。
+        直接 import 同一个模块拿到的是**同一个 store 实例**（Vite 模块缓存），
+        所以这里读到的就是 NotePalette 内部调入的那一份。
+      */
+      window.__toastLog = [];
+      let toastSeen = 0;
+      useToastStore.subscribe((s) => {
+        for (const t of s.toasts) {
+          if (t.id > toastSeen) {
+            toastSeen = t.id;
+            window.__toastLog.push(t.text);
+          }
+        }
+      });
+      window.__toasts = () => window.__toastLog;
+      window.__clearToasts = () => {
+        window.__toastLog.length = 0;
+      };
+
+      /*
+        ── 变调 / 拉伸 控件的状态观测口 ──
+        `data-transform-group` / `data-arm-required` / `data-tunable` / `data-tune-target`
+        都是组件为「可被探针查证」而加的钩子（纯样式类名改起来太自由，不适合当断言依据）。
+        其中 `data-tune-target` 尤其关键：**「控件亮着」不等于「改对了素材」**，
+        只有读实际的目标 id 才能发现「目标悄悄退化成光标行」这类错。
+      */
+      window.__transform = () => {
+        const g = (name) => document.querySelector(`[data-transform-group="${name}"]`);
+        const attr = (el, a) => (el ? el.getAttribute(a) : null);
+        const btn = (label) => document.querySelector(`button[aria-label="${label}"]`);
+        const tips = document.querySelector('p[data-tunable]');
+        return {
+          pitchDisabled: attr(g('pitch'), 'data-disabled'),
+          stretchDisabled: attr(g('stretch'), 'data-disabled'),
+          armRequired: !!document.querySelector('[data-arm-required="true"]'),
+          /*
+            快捷键提示是否可用 —— 语义 = `tuneTargetId != null`，也就是
+            「已选中行 ?? 这条音符本来就装着的素材」存在。**不是**「用户按过 Enter」。
+          */
+          shortcutsTunable: attr(tips, 'data-tunable'),
+          /*
+            调音目标的 id —— 第 6 节的核心断言靠它：
+            「控件亮着」还不够，还要证明改动落在**正确的那一个素材**上
+            （这一条是只有读实际属性才能发现的错）。
+          */
+          tuneTarget: attr(tips, 'data-tune-target'),
+          pitchValue: attr(
+            document.querySelector('[role="spinbutton"][aria-label="移调增量（半音）"]'),
+            'aria-valuetext',
+          ),
+          tauValue: attr(
+            document.querySelector('[role="spinbutton"][aria-label="时长因子"]'),
+            'aria-valuetext',
+          ),
+          minusBtnDisabled: btn('降低半音')?.disabled ?? null,
+          plusBtnDisabled: btn('升高半音')?.disabled ?? null,
+          stretchMinusDisabled: btn('缩短时长')?.disabled ?? null,
+          stretchPlusDisabled: btn('拉长时长')?.disabled ?? null,
+          /*
+            数值钩子（不是文本）。`aria-valuenow` 直接是该 spinbutton 绑定的
+            `state.staged.semitoneDelta` —— 断言「连按到顶停在哪」要的是数字，
+            从 `aria-valuetext` 里 parse 会连带把文案格式变更算成回归。
+          */
+          pitchNow: (() => {
+            const el = document.querySelector('[role="spinbutton"][aria-label="移调增量（半音）"]');
+            const v = el ? Number(el.getAttribute('aria-valuenow')) : NaN;
+            return Number.isFinite(v) ? v : null;
+          })(),
+          tauNow: (() => {
+            const el = document.querySelector('[role="spinbutton"][aria-label="时长因子"]');
+            const v = el ? Number(el.getAttribute('aria-valuenow')) : NaN;
+            return Number.isFinite(v) ? v : null;
+          })(),
+        };
+      };
+
+      /*
+        ── 变调引擎：模块状态 vs UI 声称 ──
+        切换是否「稳健」不能只看 chip 高亮 —— 那是**宣称**，不是**事实**。
+        `playSample` 第 408 行的判据是 `getActiveShift()`：它为 null 时整个外部
+        分支被跳过、静默走 wasm。所以必须能同时读到：
+          · `choice`         = 用户选了谁（UI 高亮依据）
+          · `shiftReady`     = 那个库真的加载好了吗
+          · `willUseExternal`= 播放时**实际**会不会走外部路径
+        三者不一致 = 界面在骗人。这几个口子就是为了把这种不一致量出来。
+      */
+      window.__engine = () => {
+        const choice = ext.getEngineChoice();
+        const ready = ext.getActiveShift() !== null;
+        const st = ext.getEngineStatus();
+        return {
+          choice,
+          shiftReady: ready,
+          stretchReady: st.stretchReady,
+          stretchFailed: st.stretchFailed,
+          failed: st.failed,
+          loading: ext.EXTERNAL_ENGINES.filter((e) => ext.isEngineLoading(e.id)).map((e) => e.id),
+          willUseExternal: choice !== 'wasm' && ready,
+        };
+      };
+      window.__setEnginePref = (id) => {
+        try {
+          localStorage.setItem('hajimi.transformEngine', id);
+        } catch {
+          /* 探针环境里不该失败 */
+        }
+      };
+      window.__engineChip = () => {
+        const root = document.querySelector('[data-engine-picker]');
+        if (!root) return null;
+        const chips = [...root.querySelectorAll('button')];
+        return {
+          labels: chips.map((c) => c.textContent.trim()),
+          ids: chips.map((c) => c.getAttribute('data-engine-id')),
+          activeLabel: chips
+            .filter((c) => c.className.includes('bg-flame-400'))
+            .map((c) => c.textContent.trim()),
+          disabled: chips.filter((c) => c.disabled).map((c) => c.textContent.trim()),
+          /* 组件自己声明的「实际生效引擎 / 就绪状态 / 时长安全」—— 断言「界面不骗人」靠这几个 */
+          effective: root.getAttribute('data-engine-effective'),
+          status: root.getAttribute('data-engine-status'),
+          duration: root.getAttribute('data-engine-duration'),
+          note: (root.querySelector('p')?.textContent ?? '').trim(),
+        };
+      };
+      /*
+        按**分组**读 chip。18 个引擎平铺成一排是看不出分组的，
+        而「分组信息有没有真的落到 DOM 上」只能按 DOM 层级验
+        （读一整段 textContent 会把标签和 chip 文字混在一起，无法判断归属）。
+      */
+      window.__engineGroups = () => {
+        const box = document.querySelector('[data-engine-groups]');
+        if (!box) return null;
+        return [...box.children].map((row) => ({
+          label: row.children[0]?.textContent?.trim() ?? '',
+          ids: [...row.querySelectorAll('button[data-engine-id]')].map((b) =>
+            b.getAttribute('data-engine-id'),
+          ),
+        }));
+      };
+      /** 按 id 点选某个 chip（比按可见文字找稳，改文案不会让探针假失败） */
+      window.__pickEngine = (id) => {
+        const b = document.querySelector(
+          `[data-engine-picker] button[data-engine-id="${id}"]`,
+        );
+        if (!b) return false;
+        b.click();
+        return true;
+      };
+
+      /*
+        ── 真耗时测量口（2026-09-20 用户实报「变调 / 浏览素材变的很卡」）──
+
+        为什么要在**页面里**量、而不是在 node 里跑引擎：这里的判据不是「某个引擎
+        多少毫秒」（那会随机器变），而是**同一段素材、同一个参数的第二次调用
+        应当近乎免费** —— 也就是「缓存到底有没有生效」。而缓存活在
+        `sample-player.ts` 的模块级 WeakMap 里，只有走真实 `playSample`
+        才测得到。
+
+        为什么要 `OfflineAudioContext`：`playSample` 同步做完变换后才调度源节点，
+        用一个不渲染的离线上下文就足够量到「同步变换」这一段，且不会出声。
+        另外它必须**复用同一个 buffer 对象**，WeakMap 才认得出是同一段素材。
+
+        返回值：每次调用的耗时数组（ms）。
+
+        `fresh=true` 会**换一段全新的 buffer 对象**再测 —— 缓存是
+        `WeakMap<AudioBuffer, …>`，新对象必然未命中。没有这个开关就没法区分
+        「第一次真的算了」和「上一次早就把同一个参数算过、这次直接命中」：
+        探针前面几节已经把 −12 跑过一遍，不换 buffer 的话「首次」也是命中，
+        断言名写着「首次贵」而数字全是 0.1ms —— 名字与数据对不上。
+      */
+      let perfBuf = null;
+      window.__perfShift = (semitones, repeats = 3, fresh = false) => {
+        if (fresh) perfBuf = null;
+        if (!perfBuf) {
+          const sr = 48000;
+          const off = new OfflineAudioContext(2, sr, sr);
+          perfBuf = { ctx: off, buf: off.createBuffer(2, sr, sr) };
+          for (let c = 0; c < 2; c++) {
+            const d = perfBuf.buf.getChannelData(c);
+            // 带 3Hz 幅度调制的 180Hz 正弦：够「像素材」，且各引擎都会真的干活
+            for (let i = 0; i < d.length; i++) {
+              d[i] =
+                0.3 *
+                Math.sin((2 * Math.PI * 180 * i) / sr) *
+                (0.5 + 0.5 * Math.sin((2 * Math.PI * 3 * i) / sr));
+            }
+          }
+        }
+        const { ctx, buf } = perfBuf;
+        const times = [];
+        for (let k = 0; k < repeats; k++) {
+          const t0 = performance.now();
+          try {
+            const h = sp.playSample({
+              buffer: buf,
+              destination: ctx.destination,
+              sourceContext: ctx,
+              semitones,
+              gainLinear: 1,
+              transformMode: 'psola',
+            });
+            times.push(performance.now() - t0);
+            h.stop(0);
+          } catch (err) {
+            times.push(-1);
+            window.__perfError = String(err);
+          }
+        }
+        return times;
+      };
+
+      /*
+        ── wasm 内核的装载口 ──
+
+        ⚠️ 这里踩过一次：探针页只 import 了 `sample-player`，从没调过
+        `ensureRushLoaded()` —— 于是 `isRushReady()` 恒为 false，
+        `playSample` 里 wasm 那一整支被跳过，任何 `playSample` 调用都是
+        「原样播源」（耗时 0.1ms）。第 13 节拿它当「对照组」，
+        量出来的却是「什么都没做」，一条假对照。
+
+        所以：**按需**装载（不是页面一开就装）。load 了之后每个非零半音的
+        `playSample` 都是真变换（约 280ms），前面几节有几十次试听，
+        提前装载会把探针整体拖慢十几秒。
+      */
+      window.__ensureWasm = async () => {
+        await ensureRushLoaded();
+        return isRushReady();
+      };
+
+      /*
+        ── 真渲染测量口：「放出来到底有没有声音」──
+
+        为什么必须真渲染（而不是像 `__perfShift` 那样只量同步耗时）：
+        用户报的是「无声」，而「无声」是**渲染结果**的性质，不是代码路径的性质。
+        `playSample` 返回一个句柄不等于出声；出口验收有没有挡住坏输出、
+        挡住之后有没有真的退到 wasm —— 只有把离线上下文渲出来看样点才算数。
+        这也是 `exporter.ts` 走的同一条路（`sourceContext: offline`）。
+
+        返回 `{ rms, tailRms, peak, dur, nonFinite }`：
+          · `peak`   —— 爆表（>1 = 超满刻度）直接看得出来；
+          · 末段 RMS 与整体 RMS 一起看 —— 内容被截断时后半段是静音，
+            只看整体 RMS 会被前段的爆音掩盖过去。
+      */
+      window.__renderShift = async (semitones, tau = 1) => {
+        const sr = 48000;
+        const secs = 1;
+        const off = new OfflineAudioContext(2, Math.ceil(sr * 2.5), sr);
+        const buf = off.createBuffer(2, sr * secs, sr);
+        for (let c = 0; c < 2; c++) {
+          const d = buf.getChannelData(c);
+          for (let i = 0; i < d.length; i++) {
+            d[i] =
+              0.3 *
+              Math.sin((2 * Math.PI * 180 * i) / sr) *
+              (0.5 + 0.5 * Math.sin((2 * Math.PI * 3 * i) / sr));
+          }
+        }
+        try {
+          sp.playSample({
+            buffer: buf,
+            destination: off.destination,
+            sourceContext: off,
+            semitones,
+            timeFactor: tau,
+            gainLinear: 1,
+            transformMode: 'psola',
+          });
+        } catch (err) {
+          return { error: String(err) };
+        }
+        let rendered;
+        try {
+          rendered = await off.startRendering();
+        } catch (err) {
+          return { error: 'render: ' + String(err) };
+        }
+        const d = rendered.getChannelData(0);
+        const n = sr * secs; // 只统计「源应有的那一秒」
+        let sq = 0;
+        let peak = 0;
+        let nonFinite = 0;
+        for (let i = 0; i < n; i++) {
+          const v = d[i];
+          if (!Number.isFinite(v)) {
+            nonFinite++;
+            continue;
+          }
+          sq += v * v;
+          const a = v < 0 ? -v : v;
+          if (a > peak) peak = a;
+        }
+        // 末段 = 源窗口的最后 30%，用来识别「响一下就没」的截断
+        let tailSq = 0;
+        const tailFrom = Math.floor(n * 0.7);
+        for (let i = tailFrom; i < n; i++) {
+          const v = d[i];
+          if (Number.isFinite(v)) tailSq += v * v;
+        }
+        return {
+          rms: Math.sqrt(sq / n),
+          tailRms: Math.sqrt(tailSq / Math.max(1, n - tailFrom)),
+          peak,
+          nonFinite,
+        };
+      };
+
+      /*
+        ════════════════════════════════════════════════════════════════════
+        预览时序记录器（2026-09-20 用户实报「调音只响一点点 + 手感粘滞」）
+        ════════════════════════════════════════════════════════════════════
+
+        ── 为什么要在 Web Audio 原型上打桩 ──
+
+        `playSample` 返回句柄**不等于出声**；「听到多少」由三件事决定，
+        而它们只有从原型这一层看得到：
+          · `AudioBufferSourceNode.start(when)` 的 `when`
+          · 紧接着 `stop(when')` 的 `when'`
+          · 调用瞬间的上下文时钟 `ctxT = ctx.currentTime`
+
+        ── 为什么要同时记 `when` 与 `ctxT`（这是本次调查的核心）──
+
+        包络的整条时间线是按 `when` 排的，而声音实际从 `max(when, ctxT)` 起。
+        若 `when < ctxT`，说明排包络那一刻已经比 `when` 晚了 ——
+        变换是**同步**跑在主线程上的（100~640ms），而 `when` 在变换**之前**取值，
+        于是这段延迟全部被算进「过去」。差值大到把整个包络甩进过去时，
+        增益停在收尾值上（`playSample` 里是 0.0001）：
+        **调度一切正常、句柄正常返回、就是没有声音。**
+        所以这里不仅记 `when/ctxT`，还顺着 `src.connect(env)` 抓到包络节点，
+        把**那个时刻的增益值**算出来 —— 「有没有声音」要拿数字说，不能靠推测。
+
+        ── 为什么要记长任务与帧间隔 ──
+
+        「粘滞」是**主线程被占住**的体感，不是音频层的事：
+        变换同步占住主线程时，React 的提交与浏览器绘制都排在它后面。
+        长任务（>50ms）给出「占到多久」，帧间隔给出「画面多久没动」。
+      */
+      window.__rec = { on: false, srcs: [], keys: [], frames: [], longTasks: [] };
+      const paramEvents = new Map(); // AudioParam → [{type,time,value}]
+
+      (() => {
+        const srcProto = AudioBufferSourceNode.prototype;
+        const paramProto = AudioParam.prototype;
+        const oStart = srcProto.start;
+        const oStop = srcProto.stop;
+        const oConnect = srcProto.connect;
+        const oSet = paramProto.setValueAtTime;
+        const oRamp = paramProto.linearRampToValueAtTime;
+
+        /*
+          ⚠️ 参量事件要**在首次出现时就自动登记**，不能等 `src.connect(env)` 那一步再登记：
+          `playSample` 里的顺序是「先排包络（setValueAtTime/linearRamp），后 connect」，
+          等 connect 才登记的话，整条包络事件表已经错过了 —— 那时算出来的
+          「起播时的增益」会是「没有自动化、默认 1」，把 bug 掩盖成正常。
+          （实测踩过：第一版就是这样，`gainAtStart` 全是 null。）
+        */
+        const recParam = (param, ev) => {
+          if (!window.__rec.on) return;
+          let evs = paramEvents.get(param);
+          if (!evs) {
+            evs = [];
+            paramEvents.set(param, evs);
+          }
+          evs.push(ev);
+        };
+        paramProto.setValueAtTime = function (value, time) {
+          recParam(this, { type: 'set', time, value });
+          return oSet.apply(this, arguments);
+        };
+        paramProto.linearRampToValueAtTime = function (value, time) {
+          recParam(this, { type: 'ramp', time, value });
+          return oRamp.apply(this, arguments);
+        };
+        srcProto.connect = function (dest) {
+          // 只用来把「这段源」和「它的包络节点」对上；事件表由上面的自动登记负责
+          if (dest instanceof GainNode && !this.__recEnv) this.__recEnv = dest;
+          return oConnect.apply(this, arguments);
+        };
+        srcProto.start = function (...args) {
+          const rec = window.__rec;
+          if (rec.on) {
+            const ctxT = this.context.currentTime;
+            const when = args[0] ?? 0;
+            /** 真正出声的时刻：`when` 已经过去就从现在起算（与 `playSample` 的 `startAt` 同义）*/
+            const startEff = Math.max(when, ctxT);
+            const entry = {
+              wall: performance.now(),
+              ctxT,
+              when,
+              offset: args[1] ?? 0,
+              /** `playSample` 传的第三个参数 = dur + release，是这段源最多响多久 */
+              schedDur: args[2] ?? null,
+              bufDur: this.buffer ? this.buffer.duration : null,
+              rate: this.playbackRate ? this.playbackRate.value : 1,
+              stopWhen: null,
+              /*
+                起播后 20ms 那一刻的包络增益（1 = 全开，0.0001 = 已收到尾 → 听不见）。
+
+                ⚠️ 取 `startEff + 20ms` 而不是「起播那一刻」：
+                包络**本来就**从 0.0001 起步、4ms 内升到 1（防咔哒），
+                所以起播瞬间读到的 0.0001 是设计如此、不代表有问题。
+                而按「起播瞬间」取值时，反而会把**坏掉**的情形读成 1
+                （整条包络被甩进过去 → 停在收尾值之前的平台段上），
+                指标方向正好是反的 —— 修好 `when` 之后它才「变红」。
+                20ms 落在平台段里（素材 ≳ 40ms 都成立），既避开起音斜坡、也远早于收尾。
+              */
+              gainAtStart: this.__recEnv ? envValueAt(this.__recEnv.gain, startEff + 0.02) : null,
+            };
+            rec.srcs.push(entry);
+            this.__recEntry = entry;
+          }
+          return oStart.apply(this, arguments);
+        };
+        srcProto.stop = function (...args) {
+          const rec = window.__rec;
+          if (rec.on && this.__recEntry) this.__recEntry.stopWhen = args[0] ?? 0;
+          return oStop.apply(this, arguments);
+        };
+      })();
+
+      /**
+       * 按 Web Audio 的自动化语义求 `t` 时刻的参量值。
+       * 事件表是仿着 `playSample` 的写法录下来的（set / ramp 交错），
+       * 这里只做与规范一致的分段求值：`t` 落在 ramp 中间就线性插值，
+       * 落在最后一个事件之后就取它 —— **正是「全被甩进过去」时读到的收尾值**。
+       */
+      function envValueAt(param, t) {
+        const evs = paramEvents.get(param);
+        if (!evs || evs.length === 0) return null;
+        const sorted = evs.slice().sort((a, b) => a.time - b.time);
+        let prev = { time: -Infinity, value: sorted[0].value };
+        for (const e of sorted) {
+          if (e.time <= t) {
+            prev = { time: e.time, value: e.value };
+            continue;
+          }
+          if (e.type === 'ramp' && Number.isFinite(prev.time) && e.time > prev.time) {
+            const f = (t - prev.time) / (e.time - prev.time);
+            return prev.value + (e.value - prev.value) * f;
+          }
+          return prev.value;
+        }
+        return prev.value;
+      }
+
+      window.__recStart = () => {
+        window.__rec.srcs.length = 0;
+        window.__rec.keys.length = 0;
+        window.__rec.frames.length = 0;
+        window.__rec.longTasks.length = 0;
+        paramEvents.clear();
+        window.__rec.on = true;
+        return true;
+      };
+      window.__recStop = () => {
+        window.__rec.on = false;
+        return window.__rec;
+      };
+      window.__recData = () => JSON.parse(JSON.stringify(window.__rec));
+
+      try {
+        new PerformanceObserver((list) => {
+          if (!window.__rec.on) return;
+          for (const e of list.getEntries()) {
+            window.__rec.longTasks.push({ start: e.startTime, dur: e.duration });
+          }
+        }).observe({ entryTypes: ['longtask'] });
+      } catch {
+        /* 环境没有 longtask 就退化成只看帧间隔 */
+      }
+
+      (function frameLoop() {
+        if (window.__rec.on) window.__rec.frames.push(performance.now());
+        requestAnimationFrame(frameLoop);
+      })();
+
+      /**
+       * 用**真实键盘事件**驱动调音（不是直接调 reducer）。
+       *
+       * `repeat=true` 复现「按住 Shift+↑ 不放」：重复事件一个接一个到达，
+       * 而每个事件都会再触发一次试听、上一次的变换又是同步占主线程的 ——
+       * 于是「事件到达节奏」与「变换耗时」直接互相牵制。用户报的两个症状
+       * 都发生在这个现场，所以必须照原样复现，而不是只按一下看看。
+       *
+       * 返回每次按键的：主线程占用（ms，含 React 提交）与提交后的读数，
+       * 两者一起才能区分「数值没更新」和「数值更新了但画面没机会画」。
+       */
+      window.__tune = (n = 4, intervalMs = 30, repeat = true, key = 'ArrowUp') =>
+        new Promise((resolve) => {
+          /*
+            ⚠️ 事件的落点必须选在 `onKeyDown` 容器的**后代**上。
+            踩过：第一版 dispatch 在 `[role="dialog"]`（容器的祖先）上，
+            结果是 0 个试听、数值纹丝不动 —— 因为 DOM 事件只向**上**传播，
+            祖先上的监听器收不到、后代上的监听器更收不到，整节测了个寂寞
+            （而它当时还「报绿」，因为断言写成「最多两次」这种上界）。
+            搜索框是真实交互里最常见的焦点落点（`armRow` 用完还把焦点还给它），
+            所以拿它当落点既准确又贴近真实路径。
+          */
+          const host =
+            document.querySelector('input[aria-label="搜索素材"]') ??
+            document.querySelector('[role="option"]');
+          const spin = () =>
+            document.querySelector('[role="spinbutton"][aria-label="移调增量（半音）"]');
+          const ctx = core.getAudioContext();
+          const out = [];
+          let i = 0;
+          const step = () => {
+            const t0 = performance.now();
+            const c0 = ctx.currentTime;
+            host.dispatchEvent(
+              new KeyboardEvent('keydown', {
+                key,
+                code: key,
+                bubbles: true,
+                cancelable: true,
+                shiftKey: true,
+                repeat: repeat && i > 0,
+              }),
+            );
+            out.push({
+              i,
+              rep: repeat && i > 0,
+              /** 主线程被这一次按键占住多久（含 React 提交）*/
+              ms: performance.now() - t0,
+              ctxMs: (ctx.currentTime - c0) * 1000,
+              pitchNow: Number(spin()?.getAttribute('aria-valuenow')),
+            });
+            if (++i >= n) {
+              /*
+                真的按住不放最后一定会**松手**。不补这个 keyup，
+                测的就是「松手后什么都不发生」，而不是「松手时收尾试听一次」。
+              */
+              host.dispatchEvent(
+                new KeyboardEvent('keyup', {
+                  key,
+                  code: key,
+                  bubbles: true,
+                  cancelable: true,
+                  shiftKey: true,
+                }),
+              );
+              resolve(out);
+              return;
+            }
+            setTimeout(step, intervalMs);
+          };
+          step();
+        });
+
+      /**
+       * 往 `sample-player` 的解码缓存里塞一段**人造素材**。
+       *
+       * 为什么必须塞：探针页没有真实音频文件，`previewWith` 会走到
+       * 「该素材的音频数据已丢失」那个分支直接返回 —— 于是前几节只能验
+       * 数值/文案，**验不到真正发出的声音**。`cacheBuffer` 正是模块级
+       * `bufferCache` 的写入口，塞进去之后预览走的就是和 App 里一模一样的路。
+       *
+       * 信号用「基频 + 噪声」而不是纯正弦：纯正弦是重叠相加类算法的**病态输入**
+       * （能量全在一个频点上，Hann 窗会成系统地互相抵消），拿它测会得到
+       * 「响不起来」的假结论（见 REF-dsp 里的实测记录）。
+       */
+      window.__seedPreview = (id, durSec = 1.0) => {
+        const sr = 48000;
+        const off = new OfflineAudioContext(2, 1, sr);
+        const buf = off.createBuffer(2, Math.max(1, Math.round(sr * durSec)), sr);
+        for (let c = 0; c < 2; c++) {
+          const a = buf.getChannelData(c);
+          for (let i = 0; i < a.length; i++) {
+            a[i] =
+              0.25 *
+                Math.sin((2 * Math.PI * 180 * i) / sr) *
+                (0.5 + 0.5 * Math.sin((2 * Math.PI * 3 * i) / sr)) +
+              0.04 * (Math.random() * 2 - 1);
+          }
+        }
+        sp.cacheBuffer(id, buf);
+        return { id, durSec, bufDur: buf.duration };
+      };
+
+      window.__audioState = () => {
+        const c = core.getAudioContext();
+        return { state: c.state, t: c.currentTime, sr: c.sampleRate };
+      };
+
+      window.__pitchDiag = () => pa.getPitchWorkerDiagnostics();
+
+      /**
+       * 量一次「主线程 JS YIN 应急退路」到底要多久。
+       *
+       * 为什么要专门量：我在 `pitch-async.ts` 的注释里先写了「毫秒级」——
+       * 那是**猜的**。`detectPitchYinCore` 的帧数确实是常数（`maxFrames: 24`），
+       * 但每帧的 YIN 要对整个 lag 范围做差函数，成本并不显然。
+       * 而这条退路是**在主线程**上跑的，它的耗时直接决定「掉 worker 时卡不卡」——
+       * 属于第 15 节那类「只能实测」的量，不能靠推断。
+       */
+      window.__yinCost = (id, runs = 3) => {
+        const buf = sp.getCachedBuffer(id);
+        if (!buf) return null;
+        const d = buf.getChannelData(0);
+        const out = [];
+        for (let i = 0; i < runs; i++) {
+          const t0 = performance.now();
+          const hz = pitch.detectPitchYinCore(d, buf.sampleRate, {});
+          out.push({ ms: performance.now() - t0, hz });
+        }
+        return { sr: buf.sampleRate, sec: buf.duration, runs: out };
+      };
+
+      /**
+       * 真跑一次音高检测（走 `getSamplePitchHzDetailed`，与面板同一条路）。
+       *
+       * **先清缓存**：否则会命中上一次的结果，根本测不到「worker 没了会怎样」。
+       * 这正是「指标测不到」的典型来源 —— 测的是缓存不是路径。
+       */
+      window.__detectPitch = async (id, detector = 'yin') => {
+        pa.invalidatePitchCache(id);
+        const t0 = performance.now();
+        try {
+          const r = await pa.getSamplePitchHzDetailed(id, detector);
+          return { ok: true, hz: r.hz, detector: r.detector, ms: performance.now() - t0 };
+        } catch (err) {
+          return {
+            ok: false,
+            err: String(err && err.message ? err.message : err),
+            ms: performance.now() - t0,
+          };
+        }
+      };
+      window.__audioResume = async () => {
+        const c = core.getAudioContext();
+        try {
+          await c.resume();
+        } catch (err) {
+          window.__audioResumeErr = String(err);
+        }
+        return { state: c.state, t: c.currentTime };
+      };
+
+      /**
+       * 「包络被排在过去 → 一点声音都没有」的**直接实测**。
+       *
+       * 复刻 `playSample` 的包络写法（同样的 setValueAtTime / linearRamp 序列、
+       * 同样的 `src.start(when, 0, dur + release)`），唯一变量是 `when` 距离
+       * 当前时钟多远；然后把真实渲染出来的信号送进 AnalyserNode 量 RMS。
+       *
+       * 为什么不能只靠读规范：这是「Chrome 到底怎么处理排在过去的事件」的问题，
+       * 而它决定了「无声」这个现象成不成立。量出来的才算数。
+       *
+       * 期望（与 `playSample` 的根因注释对应）：
+       *   pastMs  < dur*1000            → 包络还在平台段 → RMS 正常
+       *   pastMs  > (dur+release)*1000  → 整条包络都在过去 → 增益停在收尾值 → RMS ≈ 0
+       */
+      window.__envStale = async (pastMs = 600, durSec = 1.0) => {
+        const ctx = core.getAudioContext();
+        /*
+          ⚠️ `AudioParam` 的时间不允许为负：`when = currentTime - pastMs/1000`
+          在新上下文里会变成负数，Chrome 直接抛 RangeError。
+          所以先把时钟等够再测（实测踩过：100ms 那一档过、600ms 起全报错，
+          看起来像「落后多了就崩」，其实是负时间）。
+        */
+        const need = pastMs / 1000 + 0.05;
+        if (ctx.currentTime < need) {
+          await new Promise((r) => setTimeout(r, (need - ctx.currentTime) * 1000 + 50));
+        }
+        const sr = ctx.sampleRate;
+        const mk = new OfflineAudioContext(1, 1, sr);
+        const buf = mk.createBuffer(1, Math.max(1, Math.round(sr * durSec)), sr);
+        const d = buf.getChannelData(0);
+        for (let i = 0; i < d.length; i++) d[i] = 0.5 * Math.sin((2 * Math.PI * 180 * i) / sr);
+
+        const src = ctx.createBufferSource();
+        src.buffer = buf;
+        const env = ctx.createGain();
+        const an = ctx.createAnalyser();
+        an.fftSize = 2048;
+        an.smoothingTimeConstant = 0;
+        src.connect(env);
+        env.connect(an);
+        an.connect(ctx.destination);
+
+        const when = ctx.currentTime - pastMs / 1000;
+        const dur = durSec;
+        const attack = Math.min(0.004, dur / 3);
+        const release = Math.min(0.012, dur / 3);
+        env.gain.setValueAtTime(0.0001, when);
+        env.gain.linearRampToValueAtTime(1, when + attack);
+        env.gain.setValueAtTime(1, Math.max(when + attack, when + dur - release));
+        env.gain.linearRampToValueAtTime(0.0001, when + dur);
+        src.start(when, 0, dur + release);
+
+        await new Promise((r) => setTimeout(r, 120));
+        const a = new Float32Array(an.fftSize);
+        an.getFloatTimeDomainData(a);
+        let sq = 0;
+        for (const v of a) sq += v * v;
+        const rms = Math.sqrt(sq / a.length);
+        const gainNow = env.gain.value;
+        try {
+          src.stop();
+        } catch {
+          /* 已结束 */
+        }
+        try {
+          an.disconnect();
+          env.disconnect();
+        } catch {
+          /* noop */
+        }
+        return { pastMs, durSec, rms, gainNow, when, now: ctx.currentTime };
+      };
+
+      /**
+       * 变换耗时随素材长度的增长方式。
+       *
+       * 用户问的是「是调音生成的真实时间，还是在某些地方出现了性能问题」——
+       * 这两者要分得开，看的不是绝对毫秒（那随机器变），而是**增长阶**：
+       *   · 耗时 ∝ 长度（ms/秒 基本恒定）→ 就是实打实的计算量，属「真实时间」；
+       *   · 耗时增长快于长度（ms/秒 随长度上升）→ 算法里有超线性的东西，
+       *     那才是「性能问题」，且越长越糟。
+       *
+       * 每次都用**全新 buffer 对象**：变换结果按 `WeakMap<AudioBuffer, …>` 缓存，
+       * 复用同一个对象会让后面的档位全部命中缓存、量出来全是 0.1ms。
+       */
+      window.__scaleShift = (durs = [0.25, 0.5, 1, 2], semitones = -12) => {
+        const sr = 48000;
+        const mk = new OfflineAudioContext(2, 1, sr);
+        return durs.map((d) => {
+          const buf = mk.createBuffer(2, Math.max(1, Math.round(sr * d)), sr);
+          for (let c = 0; c < 2; c++) {
+            const a = buf.getChannelData(c);
+            for (let i = 0; i < a.length; i++) {
+              a[i] =
+                0.25 *
+                  Math.sin((2 * Math.PI * 180 * i) / sr) *
+                  (0.5 + 0.5 * Math.sin((2 * Math.PI * 3 * i) / sr)) +
+                0.04 * (Math.random() * 2 - 1);
+            }
+          }
+          const t0 = performance.now();
+          try {
+            const h = sp.playSample({
+              buffer: buf,
+              destination: mk.destination,
+              sourceContext: mk,
+              semitones,
+              gainLinear: 1,
+              transformMode: 'psola',
+            });
+            const ms = performance.now() - t0;
+            h.stop(0);
+            return { d, ms };
+          } catch (err) {
+            return { d, ms: -1, err: String(err).slice(0, 100) };
+          }
+        });
+      };
+
+      window.__ready = true;
+    </script>
+  </body>
+</html>

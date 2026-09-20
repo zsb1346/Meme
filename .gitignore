@@ -1,0 +1,60 @@
+node_modules/
+dist/
+wasm/target/
+原型/
+素材/
+OpenDWA/
+style-demos/
+.omo/
+.playwright-mcp/
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.log
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+*.local
+test-api.bat
+test-api.js
+test-api.py
+录制模式.txt
++lineStart*
+taged*
+
+# ⛔ 含硬编码 API Key 的临时脚本，永不入库
+test-api*
+
+# 探针运行的落盘产物（scripts/probe-ai/ 下的 *.html 才是要留的源）
+.probe-*.txt
+.probe-*.png
+.ls.txt
+
+# 探针的 A/B 试听 WAV。⚠️ 它在 public/ 下，**Vite 会原样拷进构建产物**
+# （实测 44 个文件 ≈ 2.78MB 白白进正式包）。部署前必须排除。
+public/_ab/
+
+# 第三方库调研的临时目录（下载的 tarball / 解包 / 本地 node_modules）
+.workbuddy/tmp/
+
+# ---------------------------------------------------------------------------
+# 以下是「只上传源代码」时排除的构建产物 / 探针落盘 / 校验快照。
+# 它们都能由源码重新生成，体积却不小（outputs/ 实测 31MB，.wasm-cmp 2.3MB）。
+# ---------------------------------------------------------------------------
+
+# 探针与构建校验的落盘目录（_ab 试听 wav / _build-check* 产物 / 探针日志）
+outputs/
+
+# Vite 在临时改写配置文件时吐出的编译快照（每次启动一个，会堆积）
+vite.config.ts.timestamp-*.mjs
+
+# 探针的点击流水 JSON（170KB）与 emoji 干跑报告
+.probe-clicks.json
+.emoji-recheck.txt
+
+# wasm 改前/改后的对比快照（各 ~1.1MB 的二进制）
+.wasm-cmp/

@@ -1,0 +1,31 @@
+[package]
+name = "hajimi-audio"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# 纯 Rust 解码库：WAV/MP3/FLAC/OGG/AAC/M4A，原生采样率输出（不受浏览器
+# decodeAudioData 强制重采样到 48k 的影响），无 C 依赖，可编译到 wasm32。
+# 关掉 default（含 mkv/adpcm/aiff/caf 等用不到的），只留鬼畜常见格式，压体积。
+symphonia = { version = "0.5", default-features = false, features = [
+    "pcm",
+    "mp3",
+    "flac",
+    "vorbis",
+    "wav",
+    "isomp4",
+    "aac",
+    "alac",
+    "ogg",
+] }
+# 相位声码器时变所需的纯 Rust FFT（离线整段渲染，非实时，性能足够）。
+rustfft = "6"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"

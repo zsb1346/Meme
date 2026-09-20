@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>AI 音高检测探针</title>
+    <style>
+      body { font: 12px/1.5 ui-monospace, monospace; background: #111; color: #ddd; padding: 12px; }
+      #out { white-space: pre-wrap; }
+      .ok { color: #7ee787; }
+      .err { color: #ff7b72; }
+    </style>
+  </head>
+  <body>
+    <pre id="out">running…</pre>
+    <script type="module">
+      const out = document.getElementById('out');
+      out.textContent = '';
+      const log = (cls, ...args) => {
+        const line = args
+          .map((a) => (typeof a === 'string' ? a : JSON.stringify(a)))
+          .join(' ');
+        out.textContent += line + '\n';
+        console.log('[probe]', line);
+        try {
+          navigator.sendBeacon('http://127.0.0.1:8799/report', line);
+        } catch {}
+      };
+
+      window.addEventListener('error', (e) => log('err', 'window.onerror: ' + e.message));
+      window.addEventListener('unhandledrejection', (e) =>
+        log('err', 'unhandledrejection: ' + String(e.reason)),
+      );
+
+      const SR = 22050;
+      function sine(hz, sec) {
+        const n = Math.round(SR * sec);
+        const x = new Float32Array(n);
+        for (let i = 0; i < n; i++) x[i] = 0.5 * Math.sin((2 * Math.PI * hz * i) / SR);
+        return x;
+      }
+
+      log('ok', '=== 环境 ===');
+      log('ok', 'UA: ' + navigator.userAgent);
+      log('ok', 'OffscreenCanvas(主线程): ' + typeof OffscreenCanvas);
+
+      let id = 0;
+      const worker = new Worker(new URL('./probe-ai.worker.ts', import.meta.url), {
+        type: 'module',
+      });
+      const pending = new Map();
+      worker.onmessage = (e) => {
+        const m = e.data;
+        if (m.kind === 'ok') {
+          log('ok', '=== AI 检测成功 ===');
+          log('ok', `  输入 ${m.inSec}s -> 重采样 ${m.resampledSec}s @22050`);
+          log('ok', `  总耗时 ${m.totalMs}ms  (import ${m.importMs} / 模型 ${m.modelMs} / 推理 ${m.inferMs})`);
+          log('ok', '  tfjs 后端: ' + m.backend);
+          log('ok', '  环境: ' + JSON.stringify(m.tfInfo));
+          log('ok', `  音符数 ${m.notes}, 主音 ${m.hz ? m.hz.toFixed(1) + ' Hz' : 'null'}`);
+        } else {
+          log('err', '=== AI 检测失败 ===');
+          log('err', `  ${m.name}: ${m.message}`);
+          log('err', `  stack: ${m.stack}`);
+          log('err', `  耗时 ${m.totalMs}ms`);
+        }
+        pending.delete(m.id);
+        if (pending.size === 0) log('ok', '--- 全部完成 ---');
+      };
+      worker.onerror = (e) => {
+        log('err', 'worker.onerror: ' + (e.message || '?') + ' @ ' + e.filename + ':' + e.lineno);
+      };
+
+      // 与 pitch-async.ts sendToWorker 完全一致：取 4 秒 PCM
+      function send(pcm, sampleRate) {
+        const maxSamples = Math.min(pcm.length, Math.floor(sampleRate * 4));
+        const copy = pcm.slice(0, maxSamples);
+        const myId = ++id;
+        pending.set(myId, true);
+        worker.postMessage({ id: myId, data: copy.buffer, sampleRate }, [copy.buffer]);
+      }
+
+      log('ok', '=== 用例 1: 4 秒 220Hz @22050（免重采样） ===');
+      send(sine(220, 4), SR);
+
+      log('ok', '=== 用例 2: 4 秒 440Hz @48000（走线性重采样） ===');
+      const sr48 = 48000;
+      const n = sr48 * 4;
+      const x48 = new Float32Array(n);
+      for (let i = 0; i < n; i++) x48[i] = 0.5 * Math.sin((2 * Math.PI * 440 * i) / sr48);
+      send(x48, sr48);
+    </script>
+  </body>
+</html>

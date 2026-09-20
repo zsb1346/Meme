@@ -1,0 +1,412 @@
+@import './styles/tokens.css';
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ═══════════════════════════════════════════════════════════════════════
+   全局基底 —— 方案 · Apple Neutral
+   ═══════════════════════════════════════════════════════════════════════ */
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+/**
+ * 没有环境光晕、没有噪点层、没有毛玻璃。
+ * 旧方案的 `body::before` 彩色光晕已删除 —— 它占带宽不传信息（戒律一：静）。
+ */
+body {
+  @apply bg-ink-950 text-slate-200 antialiased;
+  font-size: var(--fs-body);
+  overscroll-behavior: none;
+  -webkit-tap-highlight-color: transparent;
+  font-variant-numeric: tabular-nums;
+}
+
+/* 数字一律等宽 —— 专业软件感最廉价也最有效的一招 */
+.font-mono,
+[class*='tabular-nums'] {
+  font-variant-numeric: tabular-nums;
+}
+
+@layer components {
+  /**
+   * 标准面板：四级面阶梯的第二级。
+   *
+   * 层次 = 面差 + 发丝线 + 顶部 1px 内高光。**不加投影**（面板是「铺在页面
+   * 底上」的平面，投影会让它看着像浮起来的卡片，那是 web 语言）。
+   */
+  .panel {
+    background: rgb(var(--ink-900));
+    border: 1px solid rgb(var(--line));
+    border-radius: var(--r-md);
+    box-shadow: inset 0 1px 0 rgb(var(--hl));
+  }
+
+  /**
+   * 浮起面：面阶梯第三级，用于卡片 / 键帽 / 可交互块。
+   *
+   * v1 把投影当「装饰」删光了，那是误判 —— Apple 的层次正来自
+   * 「面差 + 内高光 + 极淡投影」三者叠加。这里把投影加回来，但只此一档、
+   * 只给浮起面用（面板与页面底仍然不用投影）。
+   *
+   * iOS 按钮的微渐变：顶面略亮、底面略暗，靠 `systemFill` 的两个相邻档位
+   * 实现（不是随手调透明度）。幅度刻意压得很小（4% 白 → 4% 黑），
+   * 只在近距离看得出，远了就是一整块 —— 这是「实体感」而非「渐变按钮」。
+   *
+   * 注意：投影在纯 CSS 里可以直接用 `var(--elev-1)`；
+   * 但 JSX 的 Tailwind 任意值里**不能**（见 tokens.css 的说明），必须字面写。
+   */
+  .panel-raised {
+    background: linear-gradient(
+      180deg,
+      rgb(255 255 255 / 0.05),
+      rgb(0 0 0 / 0.04)
+    ),
+    rgb(var(--ink-800));
+    border: 1px solid rgb(var(--line));
+    border-radius: var(--r-md);
+    box-shadow:
+      inset 0 1px 0 rgb(var(--hl)),
+      var(--elev-1);
+  }
+
+  /* 凹槽：比页面底更深的槽（滑轨、推子槽、键盘缝隙、canvas 底） */
+  .slot {
+    background: rgb(var(--ink-950));
+    box-shadow: inset 0 0 0 1px rgb(var(--line));
+  }
+
+  /**
+   * 兼容别名 —— 旧代码里的 .glass / .glass-raised / .neon-ring
+   * 全部落到新体系，避免遗漏处出现无样式元素。
+   */
+  .glass {
+    @apply panel;
+  }
+  .glass-raised {
+    @apply panel-raised;
+  }
+  /* 旧「霓虹描边」→ 新「强调描边」：一道实线，没有外发光 */
+  .neon-ring {
+    box-shadow: 0 0 0 1px rgb(var(--flame-400) / 0.7);
+  }
+
+  /* 发丝分隔线（水平） */
+  .hairline-b {
+    border-bottom: 1px solid rgb(var(--line));
+  }
+  /* 发丝分隔线（垂直） */
+  .hairline-r {
+    border-right: 1px solid rgb(var(--line));
+  }
+
+  /* 单行顶栏：44px，页面标题与页面工具合并于此 */
+  .topbar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    height: 44px;
+    flex-shrink: 0;
+    padding: 0 12px;
+    border-bottom: 1px solid rgb(var(--line));
+  }
+
+  /**
+   * 横向滑条 —— 轨道与拇指全部自绘（槽底 + 填充由相邻 div 承担）。
+   *
+   * 为什么要写原生伪元素而不是 Tailwind 任意 variant：
+   * `[&::-webkit-slider-thumb]:…` 这类任意 variant 在本项目里对
+   * range 伪元素不稳定（有时不生成规则），导致拇指退化为不可见。
+   * 放在 components 层用原生选择器最可靠。
+   */
+  .range-h {
+    -webkit-appearance: none;
+    appearance: none;
+    background: transparent;
+    cursor: pointer;
+  }
+  .range-h:focus {
+    outline: none;
+  }
+  /* WebKit / Blink */
+  .range-h::-webkit-slider-runnable-track {
+    height: 3px;
+    background: transparent;
+    border-radius: 9999px;
+  }
+  .range-h::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 13px;
+    height: 13px;
+    margin-top: -5px; /* 13/2 - 3/2，把拇指对齐到 3px 轨道中心 */
+    border: 0;
+    border-radius: 3px;
+    background: rgb(var(--ink-700));
+    box-shadow:
+      inset 0 1px 0 rgb(var(--hl)),
+      0 2px 4px rgb(0 0 0 / 0.6);
+  }
+  .range-h:hover::-webkit-slider-thumb {
+    background: rgb(var(--ink-600));
+  }
+  .range-h:active::-webkit-slider-thumb {
+    background: rgb(var(--flame-500));
+  }
+  /* Firefox */
+  .range-h::-moz-range-track {
+    height: 3px;
+    background: transparent;
+  }
+  .range-h::-moz-range-thumb {
+    width: 13px;
+    height: 13px;
+    border: 0;
+    border-radius: 3px;
+    background: rgb(var(--ink-700));
+    box-shadow:
+      inset 0 1px 0 rgb(var(--hl)),
+      0 2px 4px rgb(0 0 0 / 0.6);
+  }
+  .range-h:active::-moz-range-thumb {
+    background: rgb(var(--flame-500));
+  }
+
+  /* 纵向滑条（效果器参数备用） */
+  .range-v {
+    -webkit-appearance: none;
+    appearance: none;
+    background: transparent;
+    writing-mode: vertical-lr;
+    direction: rtl;
+  }
+  .range-v::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 13px;
+    height: 13px;
+    border-radius: 3px;
+    background: rgb(var(--ink-700));
+    box-shadow: inset 0 1px 0 rgb(var(--hl));
+  }
+
+  /**
+   * 关于 wavesurfer 的样式隔离（重要，避免后人再踩）：
+   *
+   * wavesurfer 7.12 把全部内部结构放在 **Shadow DOM** 里
+   * （`renderer.js` 的 `initHtml()` → `div.attachShadow({mode:'open'})`）。
+   * 因此任何写在这里的光 DOM 选择器（`.ws-inner` / `wave` / `.progress` …）
+   * 都**穿不进 shadow 树，必然是死代码** —— 别写。
+   *
+   * 要控制它的外观只有两条路：
+   *   1. `WaveSurfer.create({ waveColor, progressColor, cursorColor, ... })`
+   *      —— 这些会作为**内联样式**落到 shadow 内的元素上，是唯一可靠的入口；
+   *   2. 由宿主容器自绘并叠在下面（SampleEditorModal 采用此方案）。
+   *
+   * 本项目的做法：create() 里把 waveColor / progressColor / cursorColor 全设
+   * 为透明（只保留宽度测量与交互命中），可见波形由 SampleEditorModal 的
+   * 覆盖 canvas 用设计令牌自绘。
+   */
+
+  /* 图标按钮：26/30px 见方。圆角走 --r-sm（4px），不是胶囊 ——
+     v1 把胶囊圆角铺到图标按钮与开关滑块上，是「糖果感」的主要来源。 */
+  .icon-btn {
+    @apply relative grid place-items-center text-label-muted transition-colors;
+    width: var(--h-md);
+    height: var(--h-md);
+    border-radius: var(--r-sm);
+    background: rgb(var(--ink-800));
+    border: 1px solid rgb(var(--line));
+    box-shadow: inset 0 1px 0 rgb(var(--hl));
+  }
+  .icon-btn:hover {
+    @apply text-flame-300;
+    background: rgb(var(--ink-700));
+    border-color: rgb(var(--flame-600) / 0.5);
+  }
+  .icon-btn:active {
+    transform: translateY(1px);
+  }
+  .icon-btn[aria-pressed='true'],
+  .icon-btn.is-on {
+    background: rgb(var(--flame-600) / 0.22);
+    border-color: rgb(var(--flame-500) / 0.6);
+    @apply text-flame-300;
+  }
+}
+
+@layer utilities {
+  /* 弹性按压 —— 落定才弹，且只弹一次 */
+  .animate-press {
+    animation: press-bounce 220ms cubic-bezier(0.34, 1.56, 0.64, 1);
+  }
+  /* 呼吸 —— 只用在「运行中」的 LED 与就绪指示，待机不得动 */
+  .animate-breathe {
+    animation: breathe 2.8s ease-in-out infinite;
+  }
+  /* 面板入场 —— 淡入上移，无超冲（弹跳留给交互反馈，不给装饰） */
+  .animate-panel-in {
+    animation: panel-enter 200ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  }
+  /* 页面切换淡入 */
+  .animate-page-in {
+    animation: page-enter 180ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  }
+  /* 装载高光 —— 1px 高光从左扫过 */
+  .animate-sweep {
+    animation: sweep 200ms ease-out;
+  }
+  /* 越界抖动 —— 3px 来回 80ms */
+  .animate-nudge {
+    animation: nudge 80ms ease-in-out;
+  }
+  /* 触发闪白 —— 游标落到该格 */
+  .animate-flash {
+    animation: flash 260ms ease-out;
+  }
+  /* 删除塌陷 —— 缩 + 淡出，非瞬间消失 */
+  .animate-collapse {
+    animation: collapse 120ms ease-in both;
+  }
+  /* 值触界 —— 读数闪一次 */
+  .animate-tick {
+    animation: tick 200ms ease-out;
+  }
+
+  /* 兼容旧类名 */
+  .animate-neon {
+    animation: breathe 2.8s ease-in-out infinite;
+  }
+  .animate-scan {
+    animation: sweep-loop 2.2s linear infinite;
+  }
+
+  /* 触控热区外扩：视觉尺寸不变，命中区 ≥44px */
+  .hit-lg::after {
+    content: '';
+    position: absolute;
+    inset: -7px;
+  }
+}
+
+@keyframes press-bounce {
+  0% { transform: scale(1); }
+  40% { transform: scale(0.92); }
+  70% { transform: scale(0.98); }
+  100% { transform: scale(1); }
+}
+
+@keyframes breathe {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.45; }
+}
+
+@keyframes panel-enter {
+  0% { opacity: 0; transform: translateY(10px); }
+  100% { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes page-enter {
+  0% { opacity: 0; transform: translateY(6px); }
+  100% { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes sweep {
+  0% { transform: translateX(-100%); opacity: 0.9; }
+  100% { transform: translateX(100%); opacity: 0; }
+}
+
+@keyframes sweep-loop {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(100%); }
+}
+
+@keyframes nudge {
+  0% { transform: translateX(0); }
+  35% { transform: translateX(3px); }
+  70% { transform: translateX(-2px); }
+  100% { transform: translateX(0); }
+}
+
+@keyframes flash {
+  0% { background: rgb(255 255 255); }
+  100% { background: transparent; }
+}
+
+@keyframes collapse {
+  0% { opacity: 1; transform: scale(1); }
+  100% { opacity: 0; transform: scale(0.5); }
+}
+
+@keyframes tick {
+  0% { color: rgb(255 255 255); }
+  100% { color: inherit; }
+}
+
+/* ═══ 滚动条：细、中性、hover 才现强调色 ═══ */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgb(var(--ink-700)) transparent;
+}
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+*::-webkit-scrollbar-thumb {
+  background: rgb(var(--ink-700));
+  border-radius: 9999px;
+  border: 3px solid transparent;
+  background-clip: padding-box;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: rgb(var(--flame-600) / 0.7);
+  background-clip: padding-box;
+}
+
+/* 选区配色 */
+::selection {
+  background: rgb(var(--flame-400) / 0.3);
+  color: rgb(var(--text-hi));
+}
+
+/* 演奏区防滚动误触 */
+.touch-play-area {
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+/* 演奏台拖拽覆盖层：极简虚线框 + 脉冲，不用遮罩色块 */
+.stage-drop-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 30;
+  display: grid;
+  place-items: center;
+  pointer-events: none;
+  color: rgb(var(--flame-300));
+  font-size: var(--fs-small);
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  outline: 1.5px dashed rgb(var(--flame-400) / 0.7);
+  outline-offset: -10px;
+  background: rgb(var(--ink-950) / 0.55);
+  animation: breathe 1.6s ease-in-out infinite;
+}
+
+/* ═══ 无障碍：动效全部退化为「直接到位」 ═══ */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
