@@ -106,17 +106,21 @@ export default function App() {
     let cancelled = false;
 
     void (async () => {
-      // 预加载主线程 WASM（播放变换用）与读取本地存档并行，二者就绪后再 hydrate，
-      // 保证 UI 可演奏时相位声码器已就位。
-      const [saved] = await Promise.all([
-        loadAll().catch((err) => {
-          console.error('[app] 读取本地存档失败，使用全新工程', err);
-          return null;
-        }),
-        ensureRushLoaded().catch((err) => {
-          console.error('[app] hajimi WASM 预加载失败，播放将退化为原生变调', err);
-        }),
-      ]);
+      // ⚠️ 这里**只等读存档**，绝不要把 ensureRushLoaded() 并进 Promise.all。
+      //
+      // 曾经的写法是 `Promise.all([loadAll(), ensureRushLoaded()])` 之后才 hydrate，
+      // 意图是「UI 可演奏时相位声码器已就位」。但首次加载要下载 1.17MB 的 wasm，
+      // hydrate 因此被推迟数秒；而 hydrate 是**整体覆盖** store 的
+      // （见 store.ts：`set(() => ({ project, blobs }))` 不读旧 state），
+      // 于是用户在窗口期导入的素材会被悄悄冲掉 —— 表现为「上传显示已入库，
+      // 素材列表却是空的」；更糟的是那时自动保存订阅还没建立，连盘都没落。
+      //
+      // 现在：读存档（毫秒级）→ hydrate → 立刻建立订阅 → wasm 后台预加载。
+      // wasm 未就绪期间的播放由 isRushReady() 降级（transform.ts），不会再丢数据。
+      const saved = await loadAll().catch((err) => {
+        console.error('[app] 读取本地存档失败，使用全新工程', err);
+        return null;
+      });
       if (cancelled) return;
       hydrate(saved?.project ?? null, saved?.blobs ?? {});
 
@@ -133,6 +137,11 @@ export default function App() {
           prevEffects = s.project.effects;
           getMasterChain(s.project.effects); // 幂等 apply
         }
+      });
+
+      // 主线程 WASM 后台预加载；就绪前 playSample 走原样播放的降级路径。
+      void ensureRushLoaded().catch((err) => {
+        console.error('[app] hajimi WASM 预加载失败，播放将退化为原生变调', err);
       });
     })();
 

@@ -43,6 +43,12 @@ function isAudioFile(file: File): boolean {
 export default function LibraryPage() {
   const samples = useStore((s) => s.project.samples);
   const addSampleFromFile = useStore((s) => s.addSampleFromFile);
+  /**
+   * 存档是否已恢复。hydrate 会**整体覆盖** store，所以在那之前接受的写入
+   * 会被冲掉（历史 bug：上传显示「已入库」、列表却是空的）。这里直接挡住
+   * 并明确告知，而不是让它静默失败。
+   */
+  const hydrated = useStore((s) => s.hydrated);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const dragDepthRef = useRef(0);
@@ -61,6 +67,10 @@ export default function LibraryPage() {
 
   const handleFiles = useCallback(
     async (fileList: FileList | File[] | null) => {
+      if (!hydrated) {
+        toast({ text: '正在载入本地工程，请稍候再上传', kind: 'error' });
+        return;
+      }
       const files = Array.from(fileList ?? []).filter(isAudioFile);
       if (files.length === 0) {
         toast({
@@ -109,7 +119,7 @@ export default function LibraryPage() {
       }
       if (fileInputRef.current) fileInputRef.current.value = '';
     },
-    [addSampleFromFile],
+    [addSampleFromFile, hydrated],
   );
 
   // 搜索为空 → 按创建时间倒序；有查询 → 按相关度排序（searchByName 内部完成）
