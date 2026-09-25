@@ -3,6 +3,7 @@
     "target": "ES2020",
     "useDefineForClassFields": true,
     "lib": ["ES2021", "WebWorker"],
+    "types": ["vite/client"],
     "module": "ESNext",
     "skipLibCheck": true,
     "moduleResolution": "bundler",

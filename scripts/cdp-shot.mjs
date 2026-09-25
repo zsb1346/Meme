@@ -17,13 +17,22 @@
  *   --full                  整页截图（忽略 --sel / --clip）
  *   --eval='js'             页面加载后、截图前执行的 JS（可重复，按序执行）
  *   --click=.selector       截图前点击该选择器（可重复）
+ *   --mobile                真机视口模拟（Emulation.setDeviceMetricsOverride）
+ *   --ua='...'              覆盖 User-Agent（常与 --mobile 连用）
+ *
+ * ⚠️ 想做手机端验收**必须加 `--mobile`**。
+ *    只写 `--w=390 --h=844` 是**不够的**：那是 `--window-size`，而 Windows 上
+ *    Chrome 有最小窗口宽度（实测被钳到 **491px**），于是你以为在测 390 宽的
+ *    手机竖屏，实际测的是 491×692 的横屏小窗 —— **布局判断全错**。
+ *    修法就是走 CDP 的设备度量覆盖，绕过窗口尺寸限制（并顺带打开触摸模拟）。
  *
  * 例：
  *   node scripts/cdp-shot.mjs "file:///F:/x/preview.html" out.png --sel="#rack" --clip
  *   node scripts/cdp-shot.mjs "http://localhost:5199" mix.png --click='[data-nav="mix"]'
+ *   node scripts/cdp-shot.mjs "http://localhost:5173" phone.png --w=390 --h=844 --mobile
  */
 import { spawn } from 'node:child_process';
-import { mkdtempSync, writeFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
@@ -37,7 +46,9 @@ const CHROME_CANDIDATES = [
 
 const args = process.argv.slice(2);
 if (args.length < 2) {
-  console.error('用法: node scripts/cdp-shot.mjs <url> <out.png> [--w=] [--h=] [--sel=] [--clip] [--dsf=] [--wait=] [--full]');
+  console.error(
+    '用法: node scripts/cdp-shot.mjs <url> <out.png> [--w=] [--h=] [--sel=] [--clip] [--dsf=] [--wait=] [--full] [--profile-dir=]',
+  );
   process.exit(2);
 }
 const url = args[0];
@@ -54,6 +65,11 @@ const WAIT = Number(opt('wait', 600));
 const SEL = opt('sel', null);
 const CLIP = has('clip');
 const FULL = has('full');
+/** 真机视口模拟：绕开 Chrome 最小窗口宽度限制（见文件头 ⚠️） */
+const MOBILE = has('mobile');
+const UA = opt('ua', null);
+/** 跨运行复用的 Chrome profile（保留 IndexedDB / localStorage）；缺省每次新建 */
+const PROFILE_DIR = opt('profile-dir', null);
 /** 收集所有 --eval='…'（按出现顺序执行） */
 const EVALS = args
   .filter((a) => a.startsWith('--eval='))
@@ -70,7 +86,21 @@ if (!chromePath) {
 }
 
 const PORT = 9200 + Math.floor(Math.random() * 700);
-const profile = mkdtempSync(join(tmpdir(), 'cdp-shot-'));
+/*
+  ⚠️ 两个本机坑（都曾让截图在**中途**失败，报错却指向别处）：
+  ① profile 绝不能落 tmpdir() —— 那在 C: 盘，而 C: 长期接近满（实测 625MB），
+     Chrome 写 profile / localStorage 会 ENOSPC。统一放项目盘。
+  ② 本机挂着环境代理（HTTP_PROXY=127.0.0.1:11123，随时可能已死），
+     必须 --no-proxy-server 显式绕开，否则连 localhost 都打不开。
+
+  默认每次跑用一个**全新** profile（互不污染）。需要跨多次运行保留
+  IndexedDB / localStorage 时传 `--profile-dir=<绝对路径>`：一个很常见的
+  场景是「先播种存档 + 重载，再在另一次运行里截图」—— reload 会销毁
+  执行上下文，同一个进程里没法接着探 DOM，只能分两次跑、共用 profile。
+*/
+const profile = PROFILE_DIR
+  ? (mkdirSync(PROFILE_DIR, { recursive: true }), PROFILE_DIR)
+  : mkdtempSync(join(process.cwd(), '.workbuddy', 'tmp', 'cdp-shot') + '-');
 
 const chrome = spawn(
   chromePath,
@@ -80,6 +110,7 @@ const chrome = spawn(
     '--disable-gpu',
     '--disable-dev-shm-usage',
     '--hide-scrollbars',
+    '--no-proxy-server',
     '--force-device-scale-factor=' + DSF,
     '--remote-debugging-port=' + PORT,
     '--user-data-dir=' + profile,
@@ -157,6 +188,28 @@ try {
   cdp = await CDP.connect(wsUrl);
   await cdp.send('Page.enable');
   await cdp.send('Runtime.enable');
+
+  /*
+    真机视口模拟。必须在 Page.navigate **之前**下发，页面首帧才拿到正确的
+    视口尺寸 —— 否则会先按窗口宽度（Windows 上最小 ~491px）布局一次、
+    再被覆盖，媒体查询驱动的界面会闪一下、甚至留下错误的首屏状态。
+  */
+  if (MOBILE) {
+    await cdp.send('Emulation.setDeviceMetricsOverride', {
+      width: W,
+      height: H,
+      deviceScaleFactor: DSF,
+      mobile: true,
+      screenWidth: W,
+      screenHeight: H,
+    });
+    // 打开触摸模拟：pointerType 才会是 'touch'，也才会真的触发触摸事件
+    await cdp.send('Emulation.setTouchEmulationEnabled', {
+      enabled: true,
+      maxTouchPoints: 5,
+    });
+  }
+  if (UA) await cdp.send('Emulation.setUserAgentOverride', { userAgent: UA });
 
   const loaded = cdp.once('Page.loadEventFired');
   await cdp.send('Page.navigate', { url });

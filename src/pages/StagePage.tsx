@@ -20,13 +20,14 @@ import { ensureAudioStarted, getAudioContext } from '../engine/core';
 import { resolveSemitones } from '../model/pitch-resolve';
 import { useKeyMachineController } from '../hooks/useKeyMachineController';
 import type { MemeKeyPressResult } from '../components/keys/MemeKey';
-import PlayModeView, { type CountOption } from '../components/stage/PlayModeView';
+import PlayModeView, { countOptionOfSpan, type CountOption } from '../components/stage/PlayModeView';
 import EditMatrixView from '../components/stage/EditMatrixView';
 import SlotEditorModal, { type EditorTarget } from '../components/stage/SlotEditorModal';
 import ImportConfirmModal from '../components/stage/ImportConfirmModal';
 import { toast } from '../components/ui/toast';
 import { triggerSynthNoteAt } from '../engine/synth-preview';
 import { findKeyIndexByKey } from '../utils/key-bindings';
+import { keyPitch } from '../model/pitch-map';
 import { registerShortcut } from '../components/ui/shortcuts';
 import { useKeyAnimations } from '../hooks/useKeyAnimations';
 import { useStageShare } from '../hooks/useStageShare';
@@ -53,14 +54,14 @@ export default function StagePage() {
 
   // ---- 页面状态 ----
   const [mode, setMode] = useState<StageMode>('play');
+  /*
+    选择器档位由**音域格数**判定（12 / 24 / 36 格 = 1/2/3 个八度）。
+    刻意**不依赖半音键开关** —— 档位是音域，音域与开关无关；
+    旧实现在这里带上模式，结果拨一下开关档位就跳到「自定」，
+    用户以为音域被改了（其实一个音都没动）。
+  */
   const [countOption, setCountOption] = useState<CountOption>(() =>
-    project.settings.keyCount === 7
-      ? '7'
-      : project.settings.keyCount === 14
-        ? '14'
-        : project.settings.keyCount === 21
-          ? '21'
-          : 'custom',
+    countOptionOfSpan(project.settings.keyCount),
   );
   const [editor, setEditor] = useState<EditorTarget | null>(null);
   const [previewingKey, setPreviewingKey] = useState<number | null>(null);
@@ -78,6 +79,11 @@ export default function StagePage() {
   const playKeys = useMemo(
     () => buildTakeKeys(project, selectedTake),
     [project, selectedTake],
+  );
+  /** 各键音高（与下标同序）—— 键位矩阵钢琴布局与出声定音的依据 */
+  const keyPitches = useMemo(
+    () => playKeys.map((k, i) => keyPitch(k, i)),
+    [playKeys],
   );
 
   // ---- 控制器（KeyMachine + 缓存预热 + 游标）----
@@ -151,7 +157,11 @@ export default function StagePage() {
       ensureAudioStarted();
       const result = handlePress(keyIndex);
       if (voiceMode === 'synth') {
-        triggerSynthNoteAt(keyIndex, getAudioContext().currentTime);
+        triggerSynthNoteAt(
+          keyIndex,
+          getAudioContext().currentTime,
+          keyPitches[keyIndex],
+        );
       }
       // 非指针路径（键盘绑定）的按压 + 闪灯信号
       animatePress(keyIndex);
@@ -160,13 +170,16 @@ export default function StagePage() {
       }
       return result;
     },
-    [voiceMode, handlePress, animatePress, animateFlash],
+    [voiceMode, handlePress, animatePress, animateFlash, keyPitches],
   );
 
   const previewStopsRef = useRef<PlayingSample[]>([]);
   const previewTimerRef = useRef<number | null>(null);
 
   const keyCount = project.settings.keyCount;
+  /** 半音键开关：只决定黑键摆不摆（纯视图状态，不动键集与音域） */
+  const semitoneMode = project.settings.semitoneModeEnabled;
+  const setSemitoneMode = useStore((s) => s.setSemitoneMode);
 
   // ---------------------------------------------------------------- 编辑动作
   //
@@ -254,11 +267,20 @@ export default function StagePage() {
     return m;
   }, [project.samples]);
 
-  // 水合后 keyCount 可能被存档改写 → 同步分段选择器（八度制预设 7/14/21，其余归自定义）
+  /*
+    水合后 keyCount 可能被存档改写 → 同步分段选择器。
+
+    ⚠️ 档位只看**音域格数**（12 / 24 / 36），**不看半音键开关** ——
+    开关改变的是「这段音域露出多少个键」，不是音域本身。
+    旧实现把开关带进判定，于是拨一下开关档位就掉到「自定」，
+    用户以为音域被改了（其实一个音都没动）。
+
+    ⚠️ 但**用户正在用「自定」时绝不回弹**。旧写法无条件 setCountOption，
+    结果音域一到预设值选择器就跳回预设、步进器被卸载 ——
+    用户以为「到头了」，其实只是 UI 把路收了。必须让步给用户的选择。
+  */
   useEffect(() => {
-    setCountOption(
-      keyCount === 7 ? '7' : keyCount === 14 ? '14' : keyCount === 21 ? '21' : 'custom',
-    );
+    setCountOption((prev) => (prev === 'custom' ? 'custom' : countOptionOfSpan(keyCount)));
   }, [keyCount]);
 
   // ------------------------------------------------------------ 试听 / 行预览
@@ -492,11 +514,15 @@ export default function StagePage() {
           <PlayModeView
             keys={playKeys}
             keyCount={keyCount}
+            semitoneEnabled={semitoneMode}
+            keyPitches={keyPitches}
             countOption={countOption}
-            onCountOption={(opt) => {
-              setCountOption(opt);
-              if (opt !== 'custom') applyKeyCount(Number(opt));
-            }}
+            /*
+              只更新档位状态：**档位 → 音域格数**的换算交给 PlayModeView ——
+              它手里才有 `semitoneEnabled`（关闭半音键时要跳过黑键）。
+              （旧写法这里和组件内部各调了一次 applyKeyCount，重复下发。）
+            */
+            onCountOption={setCountOption}
             onApplyKeyCount={applyKeyCount}
             onResetAll={resetAllCursors}
             prewarmReady={prewarmReady}
@@ -507,6 +533,7 @@ export default function StagePage() {
             /* 声部 */
             voiceMode={voiceMode}
             onVoiceModeChange={setVoiceMode}
+            onSemitoneChange={setSemitoneMode}
             /* Take 选择器 */
             takes={project.takes}
             selectedTakeId={selectedTakeId}

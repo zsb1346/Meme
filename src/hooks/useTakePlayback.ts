@@ -145,10 +145,12 @@ export function createTakePlayback(
         resolveBuffer: (id) => getCachedBuffer(id),
         resolveSemitones: (id, targetPitchMidi) =>
           resolveSemitonesIn(project, id, targetPitchMidi),
-        // 合成声部：注入 playEvent 走同一 lookahead 时钟，高亮逐音符渐进
+        // 合成声部：注入 playEvent 走同一 lookahead 时钟，高亮逐音符渐进。
+        // 音高用事件自身的 pitch（卷帘拖动/装配改写过的也如实反映），
+        // 缺省才回落 keyIndex 的旧下标映射。
         playEvent:
           voice === 'synth'
-            ? (ev, when) => triggerSynthNoteAt(ev.keyIndex, when)
+            ? (ev, when) => triggerSynthNoteAt(ev.keyIndex, when, ev.pitch)
             : undefined,
         callbacks: {
           onEventScheduled: (ev) => {

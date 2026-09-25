@@ -16,6 +16,10 @@
  * 事件 Y 定位只认 `ev.keyIndex`（laneOf 收敛到 0..keyCount-1）。
  */
 import type { TakeEvent } from '../../model/types';
+import {
+  isBlackMidi,
+  keyPitchAt,
+} from '../../model/pitch-map';
 
 // ── 常量（canvas 无法用类名，故数值在此集中）──
 /** 左侧钢琴键盘栏宽 */
@@ -47,71 +51,31 @@ export const BLOCK_PAD_HIT = 3;
 /** 音符块右缘「改时长」热区宽度 */
 export const RESIZE_HANDLE_W = 5;
 
-/** 首调唱名（大音阶七音，八度分组的基本单位） */
-export const SOLFEGE = ['do', 're', 'mi', 'fa', 'sol', 'la', 'si'] as const;
-
 /** MIDI 音高全域 */
 const MIDI_PITCHES = 128;
 
-/** 十二平均律音名（pitch % 12 → 音名） */
-export const NOTE_NAMES = [
-  'C',
-  'C#',
-  'D',
-  'D#',
-  'E',
-  'F',
-  'F#',
-  'G',
-  'G#',
-  'A',
-  'A#',
-  'B',
-] as const;
-/** 黑键音级集合（八度内偏移）：C# D# F# G# A# */
-const BLACK_DEGREES = new Set([1, 3, 6, 8, 10]);
-
 /**
- * 键道 → MIDI 音高。
+ * 键道 → MIDI 音高的**兜底**（正规路径永远走 `Key.pitchMidi`）。
  *
- * 本项目的键道是「唱名制」（lane 0 = do、lane 7 = do'、lane 14 = do''…），
- * 而钢琴键盘外观需要绝对音高（决定黑键位置）。约定 **lane 0 = C4 = 60**：
- *   lane 0..6  → C4 D4 E4 F4 G4 A4 B4   （do re mi fa sol la si）
- *   lane 7     → C5 = 72                （do'）
- * 即每个八度组 7 行、音高 +12。虽然唱名制把 si→do 记为 1 个半音，
- * 但分组边界与 C 音对齐，视觉上仍是正确的钢琴，且 do 永远是 C —— 这符合直觉。
+ * ⚠️ 兜底锚点必须与**键域的起点**一致（`keyPitchAt`，C3 = 48，且键集是
+ * 连续半音序列，所以 lane 就是格号），不能再用旧的 C4 锚 ——
+ * 旧锚会让「漏传 lanePitches」表现为「卷帘比键盘高一个八度」这种
+ * **看起来像算法错了**的静默偏差。
  */
 export function pitchOfLane(lane: number): number {
-  const l = Math.max(0, Math.round(lane));
-  const octave = Math.floor(l / 7);
-  const degree = l % 7;
-  // 大调音阶相对主音的半音偏移
-  const MAJOR = [0, 2, 4, 5, 7, 9, 11];
-  return Math.min(MIDI_PITCHES - 1, 60 + octave * 12 + MAJOR[degree]);
+  return keyPitchAt(lane);
 }
 
-/** 是否黑键（钢琴键盘外观用） */
+/** 是否黑键（钢琴键盘外观用）—— 委托 pitch-map 单一实现 */
 export function isBlackPitch(pitch: number): boolean {
-  return BLACK_DEGREES.has(((Math.round(pitch) % 12) + 12) % 12);
+  return isBlackMidi(pitch);
 }
 
-/** MIDI 音号 → 音名（如 60 → "C4"，A4=69） */
-export function midiNoteName(pitch: number): string {
-  const p = Math.max(0, Math.min(MIDI_PITCHES - 1, Math.round(pitch)));
-  return `${NOTE_NAMES[p % 12]}${Math.floor(p / 12) - 1}`;
-}
-
-/** 事件的 MIDI 音高：优先 ev.pitch，缺省由键道推导 */
+/** 事件的 MIDI 音高：优先 ev.pitch，缺省由键道旧映射兜底 */
 export function pitchOf(ev: TakeEvent): number {
   return ev.pitch !== undefined
     ? Math.max(0, Math.min(MIDI_PITCHES - 1, Math.round(ev.pitch)))
     : pitchOfLane(ev.keyIndex);
-}
-
-/** 键道默认标签：唱名 + 八度撇号（do re mi fa sol la si → do′ re′…） */
-export function laneLabel(lane: number): string {
-  const l = Math.max(0, Math.round(lane));
-  return SOLFEGE[l % 7] + '′'.repeat(Math.floor(l / 7));
 }
 
 export function clamp(v: number, lo: number, hi: number): number {

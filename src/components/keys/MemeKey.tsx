@@ -23,6 +23,8 @@ export interface MemeKeyPressResult {
 export interface MemeKeyProps {
   keyIndex: number;
   label: string;
+  /** 黑键变体（钢琴几何里的半音键）：深色键帽 + 更小的字 */
+  black?: boolean;
   /** 每个槽位的素材展示名（与 sequence 等长；缺失元数据时传占位名） */
   slotNames: string[];
   /** 当前游标（0-based，指向下一个要播放的槽位） */
@@ -71,6 +73,7 @@ function usePrefersReducedMotion(): boolean {
 export default function MemeKey({
   keyIndex,
   label,
+  black = false,
   slotNames,
   cursor,
   interactive,
@@ -184,18 +187,21 @@ export default function MemeKey({
         'relative flex h-full w-full select-none flex-col items-center justify-center gap-0.5',
         'outline-none',
         'focus-visible:ring-2 focus-visible:ring-flame-400/70',
-        'rounded-md border',
+        black ? 'rounded-[3px] border' : 'rounded-md border',
         pressed
           ? 'border-flame-400 bg-flame-600/20 shadow-[inset_0_2px_6px_rgb(0_0_0/0.5)]'
-          : empty
-            ? // 空槽：**不用虚线边框**。14 个键里通常 10 个是空的，
-              // 十道虚线框会把画面变成施工图。改为「压暗 + 实线」即可。
-              'border-line bg-ink-900 shadow-none'
-            : // 浮起键帽：顶部内高光 + 极淡投影。
-              // 投影值必须**字面写出**，不能写成 `var(--elev-1)` ——
-              // Tailwind 的任意值解析对 `var()` 有歧义（会当成颜色），
-              // 混在多层简写里的 `shadow-[A,var(--b)]` 会整条失效（静默）。
-              'border-line bg-gradient-to-b from-white/[0.05] to-black/[0.04] shadow-[inset_0_1px_0_rgb(var(--hl)),0_1px_2px_rgb(0_0_0/0.35)] hover:border-line-hot',
+          : black
+            ? // 黑键：比白键**更深一级**的面（ink-950），像钢琴黑键沉下去。
+              'border-black/60 bg-ink-950 shadow-[inset_0_1px_0_rgb(255_255_255/0.06),0_2px_3px_rgb(0_0_0/0.5)] hover:border-flame-500/40'
+            : empty
+              ? // 空槽：**不用虚线边框**。14 个键里通常 10 个是空的，
+                // 十道虚线框会把画面变成施工图。改为「压暗 + 实线」即可。
+                'border-line bg-ink-900 shadow-none'
+              : // 浮起键帽：顶部内高光 + 极淡投影。
+                // 投影值必须**字面写出**，不能写成 `var(--elev-1)` ——
+                // Tailwind 的任意值解析对 `var()` 有歧义（会当成颜色），
+                // 混在多层简写里的 `shadow-[A,var(--b)]` 会整条失效（静默）。
+                'border-line bg-gradient-to-b from-white/[0.05] to-black/[0.04] shadow-[inset_0_1px_0_rgb(var(--hl)),0_1px_2px_rgb(0_0_0/0.35)] hover:border-line-hot',
       ].join(' ')}
       style={{
         touchAction: 'none',
@@ -211,15 +217,15 @@ export default function MemeKey({
     >
       {/* 键名 */}
       <span
-        className={`text-lead font-bold leading-none tracking-[-0.01em] transition-colors ${
-          pressed ? 'text-flame-300' : empty ? 'text-label-muted' : 'text-label-hi'
+        className={`${black ? 'text-body' : 'text-lead'} font-bold leading-none tracking-[-0.01em] transition-colors ${
+          pressed ? 'text-flame-300' : empty && !black ? 'text-label-muted' : black ? 'text-label-lo' : 'text-label-hi'
         }`}
       >
         {label}
       </span>
 
-      {/* 下一个素材名 */}
-      {hideSlotInfo ? null : (
+      {/* 下一个素材名（黑键太窄，不显示素材名，靠游标竖条表达） */}
+      {hideSlotInfo || black ? null : (
         <span
           className={`max-w-full truncate px-2 text-tiny leading-tight ${
             empty ? 'text-label-faint' : 'text-label-muted'

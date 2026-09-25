@@ -217,16 +217,11 @@ export function PitchDisplay({ sampleId, semitones }: Props) {
         )}
         {st.kind === 'ok' && (
           <>
-            {/* 音名 + 唱名同行：唱名降为徽章，不再单独占一行大字 */}
+            {/* 音名是唯一主视觉（唱名徽章已随全站音名统一下线） */}
             <div className="flex items-baseline gap-1.5">
               <span className="font-mono text-[34px] font-bold leading-none tracking-[-0.02em] text-flame-300">
                 {st.note}
               </span>
-              {settings.showSolfege && (
-                <span className="rounded-sm bg-flame-600/20 px-1.5 py-0.5 text-small font-medium leading-none text-flame-200">
-                  {st.sol}
-                </span>
-              )}
             </div>
             <span className="mt-1.5 font-mono text-small tabular-nums text-label-lo">
               {st.hz.toFixed(1)} Hz

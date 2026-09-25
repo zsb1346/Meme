@@ -21,6 +21,7 @@ import {
 } from '../hooks/useTakePlayback';
 import { registerShortcut, isEditableTarget } from '../components/ui/shortcuts';
 import { findKeyIndexByKey } from '../utils/key-bindings';
+import { keyPitch, isBlackMidi, midiNoteName, KEY_BASE_MIDI } from '../model/pitch-map';
 import KeyLayout from '../components/keys/KeyLayout';
 import MemeKey, { type MemeKeyPressResult } from '../components/keys/MemeKey';
 import NotePalette from '../components/fill/NotePalette';
@@ -32,8 +33,8 @@ import { formatTime } from '../utils/format';
 import { toast } from '../components/ui/toast';
 import { triggerSynthNoteAt } from '../engine/synth-preview';
 import { useKeyAnimations } from '../hooks/useKeyAnimations';
-import { importMidiFile } from '../engine/midi-import';
-import { MAX_LANE_COUNT } from '../model/midi-import';
+import { parseMidiFile, buildMidiTake, type ParsedMidiFile } from '../engine/midi-import';
+import MidiImportModal from '../components/stage/MidiImportModal';
 import { RollEmptyState } from '../components/roll/RollEmptyState';
 import { PageBar, Seg, Led } from '../components/ui/PageBar';
 import {
@@ -91,79 +92,123 @@ export default function StudioPage() {
   const keys = useStore((s) => s.project.keys);
   const samples = useStore((s) => s.project.samples);
   const addTake = useStore((s) => s.addTake);
-  /** 音域自适应用：导入的 MIDI 超出当前键数时自动调大 */
+  /** 音域自适应用：导入的 MIDI 超出当前音域时自动调大 */
   const setKeyCount = useStore((s) => s.setKeyCount);
   const deleteTake = useStore((s) => s.deleteTake);
+  /** 半音键开关：只决定黑键摆不摆（纯视图状态，不动键集与音域） */
+  const semitoneMode = useStore((s) => s.project.settings.semitoneModeEnabled);
+  const setSemitoneMode = useStore((s) => s.setSemitoneMode);
+
+  /**
+   * 键域起点音高 —— MIDI 导入的映射基准。
+   *
+   * 键集恒为「从起点起的连续半音序列」，所以 `键下标 = 音号 − 起点`
+   * 就是唯一正确的映射（音名与发声严格一致）。刻意在 `handleImportMidi`
+   * 之前求值 —— 它要用。
+   */
+  const keyBaseMidi = keys[0] ? keyPitch(keys[0], 0) : KEY_BASE_MIDI;
 
   // ---- MIDI 导入状态 ----
   const [importing, setImporting] = useState(false);
+  /**
+   * 已解析、等着用户确认的 MIDI。
+   *
+   * ⚠️ 解析与落盘必须分成两段：旧实现一步到底，于是「这首歌有几条轨、
+   * 音域多宽、有多少黑键、会丢几个音」这些**用户有权知道也能改变**的事，
+   * 只能等 Take 已经写进工程之后用一句 toast 补说。见 MidiImportModal。
+   */
+  const [pendingMidi, setPendingMidi] = useState<ParsedMidiFile | null>(null);
 
-  const handleImportMidi = useCallback(async (file: File) => {
-    if (importing) return;
-    setImporting(true);
-    try {
-      const { take, range } = await importMidiFile(file, {
-        keyCount: project.settings.keyCount,
-      });
-
-      /*
-        ══ 音域自适应（用户反馈：钢琴音域不够时会出问题）══
-
-        导入前必须先看 MIDI 的真实音域：若它超出当前键数，
-        旧实现会把超范围音符「折叠」回同一个键（C4 与 C5 都变成键道 0），
-        于是整首歌的音全撞在一起 —— 听起来完全不对，而且不报错，极难发现。
-
-        现在的做法：音域装不下就**自动把演奏台键数调大**（按整八度补齐，
-        夹在 7..28 之间），并用 toast 明确告知调到了多少、为什么。
-        这样导入即可正常演奏，用户也清楚发生了什么。
-      */
-      /*
-        ══ 音域自适应（用户反馈：钢琴音域不够时会出问题）══
-
-        两件事，顺序不能反：
-
-        ① **键道锚点平移**（已由 midiToTakeEvents 内部按 range.laneOffset 完成）。
-           乐器锚点固定在 C4 = 键道 0，而 MIDI 的 do 未必从 C4 起。
-           实测《这么可爱真是抱歉（调教用）》音域 MIDI 67..86（G4..D6），
-           比锚点高整整一个八度 —— 不平移的话低音 G4/A4/B4 会被折回上八度
-           （落到键道 11/12/13），中间 9/10 空着，整首歌的音全是错的。
-
-        ② **键数不够就自动调大**（下面这段）。音域跨度超出当前键数时，
-           必须扩容，否则超范围音符会被折叠到相近键道 → 撞音。
-      */
-      addTake(take);
-      setSelectedTakeId(take.id);
-
-      const from = project.settings.keyCount;
-      const span = range.maxLane - range.minLane + 1;
-
-      if (!range.fits && range.neededLanes > from) {
-        // notes 与 keys 一起换：先扩容再演奏
-        setKeyCount(range.neededLanes);
-        toast({
-          text:
-            `音域跨 ${span} 条键道，键数 ${from} → ${range.neededLanes}` +
-            (range.collisions > 0 ? `（否则 ${range.collisions} 个音会撞键）` : ''),
-          kind: 'success',
-        });
-      } else if (range.collisions > 0) {
-        // 已达上限仍装不下（或本身含黑键折叠）：如实告知，不静默处理
-        toast({
-          text:
-            `已导入 ${take.events.length} 个音符；` +
-            `${range.collisions} 个音折叠到相近键道` +
-            (span > MAX_LANE_COUNT ? `（音域 ${span} 条键道，超出 ${MAX_LANE_COUNT} 上限）` : '（黑键落到下方白键）'),
-          kind: 'success',
-        });
-      } else {
-        toast(`已导入 ${take.events.length} 个音符`);
+  /**
+   * 阶段一：读文件 + 逐轨体检。**不修改任何工程状态**。
+   *
+   * 解析失败（不是 MIDI / 一条音符都没有 / 全短于阈值）在这里如实报出，
+   * 弹窗根本不会打开。
+   */
+  const handleImportMidi = useCallback(
+    async (file: File) => {
+      if (importing) return;
+      setImporting(true);
+      try {
+        setPendingMidi(await parseMidiFile(file));
+      } catch (err) {
+        toast({ text: `导入失败：${(err as Error).message}`, kind: 'error' });
+      } finally {
+        setImporting(false);
       }
-    } catch (err) {
-      toast(`导入失败：${(err as Error).message}`);
-    } finally {
-      setImporting(false);
-    }
-  }, [importing, project.settings.keyCount, addTake]);
+    },
+    [importing],
+  );
+
+  /**
+   * 阶段二：用户确认后落盘。
+   *
+   * 映射本身是**一步减法**（键下标 = MIDI 音号 − 键域起点），所以
+   * 「音名 = 实际发声的音高」是天生成立的，不需要任何锚点平移。
+   * 这里只需要处理两件「导入连带要做」的事，顺序不能反：
+   *
+   *  ① **黑键要先能看见**（`setSemitoneMode(true)`）。
+   *     键集恒含黑键、但「半音键」默认是收起的 —— 不先打开的话，
+   *     一首含升号的曲子会有近五分之一的音落在**没有可点位置**的键上，
+   *     只能听、弹不出来，而且画面上看不出任何异常。
+   *
+   *  ② **音域不够就扩容**（`setKeyCount`）。必须放在 ① 之后：
+   *     收起半音键时 `setKeyCount` 会把目标格数对齐到白键格，
+   *     先扩容再开开关会平白多挪一格。
+   */
+  const confirmImportMidi = useCallback(
+    (trackIndices: number[]) => {
+      const parsed = pendingMidi;
+      if (!parsed) return;
+      setPendingMidi(null);
+      try {
+        const { take, summary } = buildMidiTake(parsed, {
+          keyCount: project.settings.keyCount,
+          baseMidi: keyBaseMidi,
+          trackIndices,
+        });
+        addTake(take);
+        setSelectedTakeId(take.id);
+
+        const needSemitone = summary.blackKeyEvents > 0;
+        const semitoneWasOn = project.settings.semitoneModeEnabled;
+        if (needSemitone && !semitoneWasOn) setSemitoneMode(true);
+
+        const from = project.settings.keyCount;
+        const grew = summary.neededLanes > from;
+        if (grew) setKeyCount(summary.neededLanes);
+
+        /* 一句话说清「装进来了什么、顺手改了什么、丢了什么」 */
+        const notes: string[] = [];
+        if (needSemitone && !semitoneWasOn) {
+          notes.push(`已打开半音键（${summary.blackKeyEvents} 个音在黑键上）`);
+        }
+        if (grew) notes.push(`键盘音域 ${from} → ${summary.neededLanes} 格`);
+        const lost = summary.tooShort + summary.belowRange + summary.aboveRange + summary.truncated;
+        if (lost > 0) notes.push(`${lost} 个音未导入`);
+
+        toast({
+          text:
+            `已导入 ${summary.keptEvents} 个音` +
+            `（${midiNoteName(summary.minMidi)}–${midiNoteName(summary.maxMidi)}）` +
+            (notes.length > 0 ? ` · ${notes.join(' · ')}` : ''),
+          kind: 'success',
+          durationMs: 4200,
+        });
+      } catch (err) {
+        toast({ text: `导入失败：${(err as Error).message}`, kind: 'error' });
+      }
+    },
+    [
+      pendingMidi,
+      project.settings.keyCount,
+      project.settings.semitoneModeEnabled,
+      keyBaseMidi,
+      addTake,
+      setKeyCount,
+      setSemitoneMode,
+    ],
+  );
 
   // ---- 页面状态 ----
   const [tab, setTab] = useState<TabId>('split');
@@ -214,6 +259,11 @@ export default function StudioPage() {
   // ---- 自动修音全局开关 ----
   const autoTuneEnabled = useStore((s) => s.project.settings.autoTuneEnabled);
   const setAutoTuneEnabled = useStore((s) => s.setAutoTuneEnabled);
+  /** 各键音高（与下标同序）—— 键位矩阵钢琴布局的分组依据 */
+  const keyPitches = useMemo(
+    () => keys.map((k, i) => keyPitch(k, i)),
+    [keys],
+  );
 
   // ---- 分屏传输：单一 playback 控制器；「音频/电子音」只是声部切换 ----
   const [transportMode, setTransportMode] = useState<'audio' | 'synth'>('audio');
@@ -382,21 +432,23 @@ export default function StudioPage() {
       useStore.getState().setKeyCursor(keyIndex, result.cursorAfter);
 
       // ③ 记录事件（recorder 内部判 running，未录返回 null）
-      const ev = getRecorder().notifyKeyPress(keyIndex);
+      //    音高 = 键的固定身份（pitchMidi），不再由下标推导
+      const pitchMidi = keyPitch(keys[keyIndex], keyIndex);
+      const ev = getRecorder().notifyKeyPress(keyIndex, 1, pitchMidi);
       if (ev) setEventCount((n) => n + 1);
 
       // ④ 发声：四分支互斥，绝不叠加
       if (result.triggered) {
         // 采样已发声 → 录制中补钢琴跟弹（参考音），非录制不补
-        if (ev) getRecorder().playFeedback(keyIndex);
+        if (ev) getRecorder().playFeedback(keyIndex, pitchMidi);
       } else {
         // 采样哑（空键 / 缓冲未就绪 / 静音模式）→ 电子音兜底
-        triggerSynthNoteAt(keyIndex, getAudioContext().currentTime);
+        triggerSynthNoteAt(pitchMidi, getAudioContext().currentTime);
       }
 
       return { triggered: result.triggered, slotIndex: result.slotIndex };
     },
-    [keys.length, getMachine, getRecorder],
+    [keys, getMachine, getRecorder],
   );
   const tapKeyRef = useRef(wrappedTapKey);
   tapKeyRef.current = wrappedTapKey;
@@ -932,9 +984,27 @@ export default function StudioPage() {
           <div className="mb-2 flex items-center justify-between">
             <h2 className="text-small font-semibold text-label-lo">演奏键位</h2>
             <div className="flex items-center gap-2">
-              <p className="hidden text-tiny text-label-faint sm:block">
-                点「键盘绑定」设置自定义快捷键
-              </p>
+              {/*
+                半音键开关 —— **纯视图开关**：黑键一直在后台铺好了，
+                这里只决定摆不摆它们。键集、音域、Take 里的音符一个都不动。
+              */}
+              <button
+                type="button"
+                onClick={() => setSemitoneMode(!semitoneMode)}
+                aria-pressed={semitoneMode}
+                title={
+                  semitoneMode
+                    ? '半音键已显示（每八度 12 键）。关掉只是把黑键收起来，音域与已装的素材都不变'
+                    : '半音键已收起（每八度 7 个白键）。打开即出现全部黑键 —— 它们一直就在，不需要手动添加'
+                }
+                className={`h-ctl-sm rounded-sm px-2.5 text-small font-medium transition-colors ${
+                  semitoneMode
+                    ? 'bg-flame-600/25 text-flame-200'
+                    : 'text-label-lo hover:bg-ink-800 hover:text-label-hi'
+                }`}
+              >
+                半音键
+              </button>
               <button
                 type="button"
                 onClick={() => {
@@ -956,6 +1026,9 @@ export default function StudioPage() {
           <div className="touch-play-area rounded-md bg-ink-900 p-2.5 shadow-[inset_0_0_0_1px_rgb(var(--line))]">
             <KeyLayout
               keyCount={keys.length}
+              keyPitches={keyPitches}
+              /* 半音键收起时只摆白键（键对象还在，装配也还在） */
+              hideBlackKeys={!semitoneMode}
               renderKey={(i) => {
                 const k = keys[i];
                 if (!k) return null;
@@ -964,6 +1037,8 @@ export default function StudioPage() {
                   <MemeKey
                     keyIndex={i}
                     label={k.label}
+                    /* 黑键由**音高**决定，与半音开关无关（关掉开关不会把黑键变成白键） */
+                    black={isBlackMidi(keyPitch(k, i))}
                     slotNames={bindingMode ? [] : k.sequence.map((r) => r.sampleId ? (nameById.get(r.sampleId) ?? '未知素材') : '未装配')}
                     cursor={k.cursor ?? 0}
                     interactive={!bindingMode}
@@ -1004,6 +1079,20 @@ export default function StudioPage() {
               take={selectedTake}
               keyCount={keys.length}
               keyLabels={keys.map((k) => k.label)}
+              /*
+                ⚠️ 必须传 lanePitches —— 少了它卷帘的左侧钢琴栏会回落到
+                「旧下标映射」（lane 0 = C4），而键位的权威音高是 C3 起，
+                两边**整整差一个八度**；而且回落的映射把所有行都当白键，
+                于是开着半音也不显示黑键行（用户实报「卷帘没配合半音」）。
+              */
+              lanePitches={keyPitches}
+              /*
+                半音键收起时，卷帘**不隐藏**黑键行（藏起来等于藏起那行上的
+                音符，用户会以为音符丢了），而是把那排键标成「关着」——
+                钢琴栏画空心轮廓。键盘与卷帘因此讲同一个故事：
+                位置都在，只是现在按不了。
+              */
+              blackLanesDisabled={!semitoneMode}
               playing={splitPlaying}
               playheadSec={splitPlayheadSec}
               highlightedEventIndex={rollHighlight}
@@ -1186,6 +1275,18 @@ export default function StudioPage() {
 
       {/* 导出对话框 */}
       <ExportDialog open={exportOpen} onClose={() => setExportOpen(false)} />
+
+      {/* MIDI 导入确认（解析完先在弹窗里说清楚，确认后才落盘） */}
+      {pendingMidi && (
+        <MidiImportModal
+          parsed={pendingMidi}
+          keyCount={project.settings.keyCount}
+          baseMidi={keyBaseMidi}
+          semitoneEnabled={semitoneMode}
+          onCancel={() => setPendingMidi(null)}
+          onConfirm={confirmImportMidi}
+        />
+      )}
 
       {/* 全局效果器弹层（自旧填词面板迁移；卷帘传输槽唤起） */}
       {fxOpen && <EffectPopup open={fxOpen} onClose={() => setFxOpen(false)} />}

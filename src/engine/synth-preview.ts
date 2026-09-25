@@ -23,9 +23,9 @@ let synth: Tone.PolySynth | null = null;
 let bus: Tone.Gain | null = null;
 const pendingTimers = new Set<ReturnType<typeof setTimeout>>();
 
-function triggerSynthNoteNow(keyIndex: number): void {
+function triggerSynthNoteNow(keyIndex: number, pitchMidi?: number): void {
   ensureVoice().triggerAttackRelease(
-    midiToHz(keyIndexToMidi(keyIndex)),
+    midiToHz(pitchMidi ?? keyIndexToMidi(keyIndex)),
     NOTE_SEC,
     undefined,
   );
@@ -47,18 +47,23 @@ function ensureVoice(): Tone.PolySynth {
 }
 
 /**
- * 在绝对 AudioContext 时刻 whenCtxSec 响一声（keyIndex → 大调音阶音高）。
+ * 在绝对 AudioContext 时刻 whenCtxSec 响一声。
+ * 音高优先取 pitchMidi（Key.pitchMidi / 事件的 pitch），缺省回落旧下标映射。
  * whenCtxSec 必须来自 TakePlayer 的时钟模型（origin + ev.tSec）。
  */
-export function triggerSynthNoteAt(keyIndex: number, whenCtxSec: number): void {
+export function triggerSynthNoteAt(
+  keyIndex: number,
+  whenCtxSec: number,
+  pitchMidi?: number,
+): void {
   const delayMs = Math.max(0, (whenCtxSec - Tone.getContext().now()) * 1000);
   if (delayMs < 4) {
-    triggerSynthNoteNow(keyIndex);
+    triggerSynthNoteNow(keyIndex, pitchMidi);
     return;
   }
   const timer = setTimeout(() => {
     pendingTimers.delete(timer);
-    triggerSynthNoteNow(keyIndex);
+    triggerSynthNoteNow(keyIndex, pitchMidi);
   }, delayMs);
   pendingTimers.add(timer);
 }

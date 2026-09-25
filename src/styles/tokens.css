@@ -130,13 +130,17 @@
   --r-md: 6px;
   --r-lg: 10px;
 
-  /* ═══ 字号（六档，body 压到 12.5px 以省空间）═══ */
-  --fs-micro: 9px;
-  --fs-tiny: 10px;
-  --fs-small: 11px;
-  --fs-body: 12.5px;
-  --fs-lead: 14px;
-  --fs-title: 17px;
+  /* ═══ 字号（六档）═══
+     2026-09-20 整体上调一档：micro 9→11 / body 12.5→13.5。
+     理由：9px 在 1080p 上就是糊的，这是「显得旧」的头号原因；
+     现代工具（Linear / Figma / PitchNet）正文 13–14、标签 11–12。
+     注意 --fs-micro 是**字号下限**，不要再往 9px 回退。 */
+  --fs-micro: 11px;
+  --fs-tiny: 11.5px;
+  --fs-small: 12px;
+  --fs-body: 13.5px;
+  --fs-lead: 15px;
+  --fs-title: 18px;
 
   /* ═══ 控件高度（三档；触控热区靠 ::after 外扩，不靠视觉尺寸）═══ */
   --h-sm: 26px;

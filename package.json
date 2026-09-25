@@ -34,6 +34,7 @@
     "@soundtouchjs/core": "^2.1.1",
     "@soundtouchjs/stretch-phase-vocoder": "^2.1.1",
     "@spotify/basic-pitch": "^1.0.1",
+    "@tensorflow/tfjs": "^3.21.0",
     "@tonejs/midi": "^2.0.28",
     "idb": "^8.0.0",
     "jszip": "^3.10.1",

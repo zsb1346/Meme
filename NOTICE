@@ -1,0 +1,85 @@
+哈吉米 · Meme Studio —— 第三方组件声明
+=========================================
+
+本软件以 GNU Affero General Public License v3.0 发布（全文见 LICENSE）。
+下列第三方组件随本软件一同分发，其版权归各自作者所有。
+
+本软件**未修改**这些组件的源代码，它们通过 npm 依赖引入，
+确切版本以 package-lock.json 为准。
+
+
+一、必须保留的版权声明（Apache-2.0）
+------------------------------------
+
+Apache License 2.0 第 4(d) 条要求：分发方必须保留原作品的 NOTICE 内容。
+以下两个组件带有此义务。
+
+Spotify Basic Pitch
+  版本    1.0.1
+  许可    Apache License 2.0
+  版权    Copyright (c) Spotify AB
+  项目    https://github.com/spotify/basic-pitch
+  用途    AI 音高检测（音频转音符），运行在 Web Worker 中
+  说明    许可全文见 node_modules/@spotify/basic-pitch/LICENSE
+
+TensorFlow.js
+  版本    3.21.0
+  许可    Apache License 2.0
+  版权    Copyright (c) Google LLC
+  项目    https://github.com/tensorflow/tfjs
+  用途    Basic Pitch 的推理后端（本项目中运行于 CPU / WebGL 后端）
+
+
+二、其余组件清单
+----------------
+
+MIT（23 个）
+  @audio/shift-delay 1.0.2            @audio/shift-formant 1.1.4
+  @audio/shift-granular 1.0.2         @audio/shift-hpss 1.0.2
+  @audio/shift-hybrid 1.0.2           @audio/shift-lpc 1.0.2
+  @audio/shift-ola 1.0.3              @audio/shift-paulstretch 1.1.4
+  @audio/shift-psola 1.0.3            @audio/shift-pvoc 1.1.4
+  @audio/shift-pvoc-lock 1.0.2        @audio/shift-sample 1.0.2
+  @audio/shift-sms 1.0.2              @audio/shift-transient 1.0.2
+  @audio/shift-wsola 1.0.3            @audio/stretch-psola 1.2.1
+  @audio/stretch-wsola 1.2.1          @tonejs/midi 2.0.28
+  pinyin-pro 3.29.3                   react 18.3.1
+  react-dom 18.3.1                    tone 15.1.22
+  zustand 4.5.7
+
+MPL-2.0（2 个）
+  @soundtouchjs/core 2.1.1
+  @soundtouchjs/stretch-phase-vocoder 2.1.1
+
+BSD-3-Clause（1 个）
+  wavesurfer.js 7.12.11
+
+ISC（1 个）
+  idb 8.0.3
+
+
+三、Copyleft 组件的合规说明
+---------------------------
+
+lamejs 1.2.1 —— LGPL-3.0
+  用途：MP3 编码（导出音频）。
+  本项目以**未修改**的形式引入该库，并保持其独立的模块边界（通过 ESM 导入
+  使用，未与自身代码混合成同一份衍生文件），符合 LGPL-3.0 的相应要求。
+  用户可自行获取该库源码：https://github.com/zhuker/lamejs
+
+@soundtouchjs/core、@soundtouchjs/stretch-phase-vocoder —— MPL-2.0
+  用途：时间伸缩与相位声码器（第三方变调引擎对比功能）。
+  MPL-2.0 是**文件级** copyleft：本项目未修改这两个库的任何文件，
+  因此不产生源码披露义务。
+
+jszip 3.10.1 —— 声明为 "MIT OR GPL-3.0-or-later"
+  用途：打包导出。
+  本项目按 **MIT** 条款使用该组件（双许可允许接收方二选一）。
+
+
+四、许可兼容性
+--------------
+
+以上全部组件的许可（MIT / Apache-2.0 / MPL-2.0 / BSD-3-Clause / ISC /
+LGPL-3.0，以及 jszip 的 MIT 选项）**均与 AGPL-3.0 兼容**，
+不存在 GPL-only 的强制传染组件。

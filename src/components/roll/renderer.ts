@@ -23,11 +23,11 @@
  *   幽灵残影 → 事件块 → 橡皮筋选框 → 播放头 → 键盘栏右缘分隔线 → 缩放读数
  */
 import type { TakeEvent } from '../../model/types';
+import { midiNoteName } from '../../model/pitch-map';
 import { withAlpha, type ThemeTokens } from '../../styles/getTokens';
 import {
   GUTTER_W,
   RULER_H,
-  SOLFEGE,
   blockSize,
   blockTop,
   isBlackPitch,
@@ -81,6 +81,21 @@ export interface RenderState {
   /** 播放头位置（秒）；<0 不绘制 */
   playheadSec: number;
   keyLabels?: string[];
+  /**
+   * 各键道行的权威音高（Key.pitchMidi 的逐行投影）。
+   * 缺省时回落旧下标映射（pitchOfLane）—— 只应发生在「调用方没接 store」
+   * 的演示/测试场景。
+   */
+  lanePitches?: number[];
+  /**
+   * 半音键已收起（演奏键盘上不摆黑键）。
+   *
+   * 卷帘**照常显示全部音高行** —— 它是数据视图，藏起一整行等于藏起那一行上的
+   * 音符（用户会以为音符丢了）。但把黑键行标成「关着」：
+   * 行带压得更暗、钢琴栏的黑键改画成**空心轮廓**，
+   * 一眼看出「这排键存在、只是现在按不了」。
+   */
+  blackLanesDisabled?: boolean;
   colors: ThemeTokens;
   /** 橡皮筋选框；null 不绘制 */
   marquee: MarqueeRect | null;
@@ -129,11 +144,11 @@ export function draw(ctx: CanvasRenderingContext2D, state: RenderState): void {
 
   for (let r = firstRow; r <= lastRow; r++) {
     const y = RULER_H + r * l.rowH - v.sy;
-    const pitch = pitchOfLane(r);
+    // 权威音高 = 该行键的 pitchMidi（缺省回落旧映射，见 RenderState.lanePitches）
+    const pitch = state.lanePitches?.[r] ?? pitchOfLane(r);
     const black = isBlackPitch(pitch);
     const pc = ((pitch % 12) + 12) % 12;
     const isC = pc === 0;
-    const octave = Math.floor(r / 7);
 
     /* ── 时间线区：两级对比底色（用户反馈：对比度太低看不出行）──
        白键行（唱名行）用「浮起面」色，黑键行用「页面底」色。
@@ -151,11 +166,19 @@ export function draw(ctx: CanvasRenderingContext2D, state: RenderState): void {
     // 黑键：压暗 + 内缩（右缘留出白键可见 1/3），模拟真钢琴的短黑键
     if (black) {
       const bw = GUTTER_W * 0.6;
-      ctx.fillStyle = c.ink950;
-      ctx.fillRect(0, y, bw, l.rowH);
-      ctx.fillStyle = 'rgba(0,0,0,0.7)';
-      ctx.fillRect(0, y, bw, 1);
-      ctx.fillRect(bw - 1, y, 1, l.rowH);
+      if (state.blackLanesDisabled) {
+        /* 半音键已收起：黑键画成**空心轮廓** —— 「位置在、现在是关着的」。
+           行带底色不再加深（音符块还要在这行上清楚可读）。 */
+        ctx.strokeStyle = withAlpha(c.flame400, 0.45);
+        ctx.lineWidth = 1;
+        ctx.strokeRect(0.5, y + 0.5, bw - 1, Math.max(1, l.rowH - 1));
+      } else {
+        ctx.fillStyle = c.ink950;
+        ctx.fillRect(0, y, bw, l.rowH);
+        ctx.fillStyle = 'rgba(0,0,0,0.7)';
+        ctx.fillRect(0, y, bw, 1);
+        ctx.fillRect(bw - 1, y, 1, l.rowH);
+      }
     } else {
       ctx.fillStyle = c.ink800;
       ctx.fillRect(0, y, GUTTER_W, l.rowH);
@@ -187,26 +210,17 @@ export function draw(ctx: CanvasRenderingContext2D, state: RenderState): void {
       ctx.fillRect(GUTTER_W, y, l.viewW, l.rowH);
     }
 
-    /* ── 键盘栏文字（用户反馈：要写清楚 do re mi fa）──
-       两列布局：左窄列放八度序号（仅 C 行），右列放唱名。
-       行高足够时「每行都标唱名」，否则只标 C 行（避免糊成一团）。 */
+    /* ── 键盘栏文字：音名（C4 / D#5…）──
+       全站统一科学音高记谱（见 pitch-map）。行高足够时每行都标，
+       否则只给 C 行留一条强调缝，避免小行高下糊成一团。 */
     if (l.rowH >= 12) {
-      // 唱名：贴右对齐
       ctx.textAlign = 'right';
-      const syl = SOLFEGE[r % 7];
+      const name = midiNoteName(pitch);
       ctx.font = isC
         ? `700 ${l.rowH >= 20 ? 10 : 9}px ${MONO}`
         : `${l.rowH >= 20 ? 10 : 9}px ${MONO}`;
       ctx.fillStyle = isC ? c.flame300 : black ? c.textMuted : c.textLo;
-      ctx.fillText(syl, GUTTER_W - 5, y + l.rowH / 2 + 0.5);
-
-      // 八度序号：仅 C 行，放左缘（给「现在是第几个八度」一个锚点）
-      if (isC) {
-        ctx.textAlign = 'left';
-        ctx.font = `9px ${MONO}`;
-        ctx.fillStyle = c.textFaint;
-        ctx.fillText(String(octave + 1), 6, y + l.rowH / 2 + 0.5);
-      }
+      ctx.fillText(name, GUTTER_W - 5, y + l.rowH / 2 + 0.5);
     } else if (isC) {
       // 行高压得很小时，只留一条强调条作为唯一定位线索
       ctx.fillStyle = withAlpha(c.flame300, 0.8);

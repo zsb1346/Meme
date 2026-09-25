@@ -81,7 +81,6 @@ const FIELDS = [
 
   { key: 'a4Hz', kind: 'number', group: '显示', label: 'A4 基准', min: 400, max: 480, step: 1, unit: 'Hz' },
 
-  { key: 'showSolfege', kind: 'bool', group: '显示', label: '显示唱名' },
   { key: 'showCents', kind: 'bool', group: '显示', label: '显示音分' },
 ] as const satisfies ReadonlyArray<Field>;
 

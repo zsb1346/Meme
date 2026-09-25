@@ -13,6 +13,7 @@ import {
   IconBrand,
   IconLibrary,
   IconMix,
+  IconSource,
   IconStage,
   IconStudio,
 } from './components/ui/Icon';
@@ -34,6 +35,18 @@ const NAV_ITEMS: ReadonlyArray<{
   { id: 'studio', label: '制作台', hint: '3', Icon: IconStudio },
   { id: 'mix', label: '混音台', hint: '4', Icon: IconMix },
 ];
+
+/**
+ * 源码仓库地址 —— AGPL-3.0 §13 的合规入口。
+ *
+ * 本项目是 AGPL-3.0 的衍生作品（`wasm/src/psola.rs` 逐行对照 PitchNet 的
+ * 参考实现重写），所以「通过网络与之交互的用户」必须能拿到对应源码。
+ * 许可证正文对此的建议原文是：
+ *   "if your program is a web application, its interface could display a
+ *    'Source' link that leads users to an archive of the code."
+ * 所以这个链接必须出现在界面里，而不是只写在 README 里。
+ */
+const SOURCE_URL = 'https://github.com/zsb1346/Meme';
 
 // ---------------------------------------------------------------------------
 // 页面路由表。「素材」页即素材箱（LibraryPage）：
@@ -237,6 +250,17 @@ export default function App() {
             <span className="whitespace-nowrap font-mono text-micro text-label-muted opacity-0 transition-opacity duration-150 group-hover:opacity-100">
               {keyCount} 键 · {sampleCount} 素材
             </span>
+            {/* AGPL-3.0 §13：源码入口。跟随侧栏的 hover 展开显示 */}
+            <a
+              href={SOURCE_URL}
+              target="_blank"
+              rel="noreferrer noopener"
+              title="查看源码（AGPL-3.0）"
+              className="ml-auto flex shrink-0 items-center gap-1.5 rounded-sm text-micro text-label-lo opacity-0 transition-opacity duration-150 hover:text-flame-300 focus-visible:opacity-100 group-hover:opacity-100"
+            >
+              <IconSource size={14} />
+              <span className="whitespace-nowrap">源码</span>
+            </a>
           </div>
         </div>
       </aside>
@@ -284,6 +308,17 @@ export default function App() {
             </button>
           );
         })}
+        {/* AGPL-3.0 §13：移动端也必须有源码入口（底栏常驻可见） */}
+        <a
+          href={SOURCE_URL}
+          target="_blank"
+          rel="noreferrer noopener"
+          title="查看源码（AGPL-3.0）"
+          className="flex min-h-[52px] flex-1 flex-col items-center justify-center gap-0.5 text-micro font-medium text-label-muted transition-colors active:text-label-lo"
+        >
+          <IconSource size={20} />
+          源码
+        </a>
       </nav>
 
       {/* 全局 toast（全站唯一挂载点） */}

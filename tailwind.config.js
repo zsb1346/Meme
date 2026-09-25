@@ -138,26 +138,35 @@ export default {
         '3xl': '10px',
       },
 
-      /* —— 字号六档（body 压到 12.5px）—— */
+      /**
+       * 字号六档 —— **必须引用 `tokens.css` 的变量，不能写死像素**。
+       *
+       * ⚠️ 这里曾经写死 `micro: '9px'` 等旧值，而 `tokens.css` 里
+       * `--fs-micro` 已经上调到 11px —— 那批变量**从来没有被消费过**，
+       * 于是「字号整体上调一档」这个改动在界面上**一点效果都没有**，
+       * 看代码却完全正常（变量在、注释也在）。这就是最贵的那类静默失效。
+       *
+       * 现在唯一来源是 `tokens.css`：改字号只动那里，这里自动跟上。
+       */
       fontSize: {
-        micro: ['9px', { lineHeight: '1.35' }],
-        tiny: ['10px', { lineHeight: '1.4' }],
-        small: ['11px', { lineHeight: '1.45' }],
-        body: ['12.5px', { lineHeight: '1.5' }],
-        lead: ['14px', { lineHeight: '1.45' }],
-        title: ['17px', { lineHeight: '1.3' }],
+        micro: ['var(--fs-micro)', { lineHeight: '1.35' }],
+        tiny: ['var(--fs-tiny)', { lineHeight: '1.4' }],
+        small: ['var(--fs-small)', { lineHeight: '1.45' }],
+        body: ['var(--fs-body)', { lineHeight: '1.5' }],
+        lead: ['var(--fs-lead)', { lineHeight: '1.45' }],
+        title: ['var(--fs-title)', { lineHeight: '1.3' }],
       },
 
-      /* —— 控件高度三档 —— */
+      /* —— 控件高度三档（同样引用变量，避免两处漂移）—— */
       height: {
-        'ctl-sm': '26px',
-        'ctl-md': '30px',
-        'ctl-lg': '36px',
+        'ctl-sm': 'var(--h-sm)',
+        'ctl-md': 'var(--h-md)',
+        'ctl-lg': 'var(--h-lg)',
       },
       minHeight: {
-        'ctl-sm': '26px',
-        'ctl-md': '30px',
-        'ctl-lg': '36px',
+        'ctl-sm': 'var(--h-sm)',
+        'ctl-md': 'var(--h-md)',
+        'ctl-lg': 'var(--h-lg)',
       },
 
       /* —— 动效曲线 —— */

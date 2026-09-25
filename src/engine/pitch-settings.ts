@@ -13,7 +13,6 @@ export interface PitchSettings {
   maxHz: number;
   // 显示组（改 → 只重渲染）
   a4Hz: number;
-  showSolfege: boolean;
   showCents: boolean;
 }
 
@@ -23,7 +22,6 @@ export const DEFAULTS: PitchSettings = {
   minHz: 65,
   maxHz: 1200,
   a4Hz: 440,
-  showSolfege: true,
   showCents: true,
 };
 
@@ -78,8 +76,7 @@ export function loadPitchSettings(): PitchSettings {
         ? parsed.maxHz : DEFAULTS.maxHz,
       a4Hz: typeof parsed.a4Hz === 'number' && Number.isFinite(parsed.a4Hz)
         ? parsed.a4Hz : DEFAULTS.a4Hz,
-      showSolfege: typeof parsed.showSolfege === 'boolean'
-        ? parsed.showSolfege : DEFAULTS.showSolfege,
+      // showSolfege 已随全站音名统一（C4 式）下线：旧存档里的该字段直接忽略
       showCents: typeof parsed.showCents === 'boolean'
         ? parsed.showCents : DEFAULTS.showCents,
     };

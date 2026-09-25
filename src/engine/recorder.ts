@@ -2,24 +2,31 @@ import * as Tone from 'tone';
 import type { Take, TakeEvent } from '../model/types';
 import { getAudioContext } from './core';
 import { midiToHz } from './pitch';
+import { keyPitchAt } from '../model/pitch-map';
 import { uid } from '../utils/uid';
 
 /**
  * 录制（计划 §4.3）：
  * - 事件时间戳一律取 audioContext.currentTime（相对录制起点），禁用 Date.now()
- * - 按键同时触发「真实音准钢琴反馈音」（do re mi…，按大调音阶映射键位）
+ * - 按键同时触发「真实音准钢琴反馈音」（按 Key.pitchMidi 定音高）
  * - 两段式按住时长：notifyKeyPress 记录事件（duration 留空），notifyKeyRelease
  *   在松开时用音频时钟补写 duration（秒）；播放/导出暂不消费该字段
  * - 反馈音走独立 gain 直连输出，绝不进主效果链、绝不进导出渲染
  */
 
-/** 大调全音阶半音级（do re mi fa sol la si） */
-const MAJOR_STEPS: readonly number[] = [0, 2, 4, 5, 7, 9, 11];
-
-/** 键位 → MIDI 音高：从 C4(60) 开始按大调音阶铺开，跨八度循环。 */
-export function keyIndexToMidi(keyIndex: number, baseMidi = 60): number {
-  const octave = Math.floor(keyIndex / MAJOR_STEPS.length);
-  return baseMidi + octave * 12 + (MAJOR_STEPS[keyIndex % MAJOR_STEPS.length] ?? 0);
+/**
+ * 键位 → MIDI 音高的**兜底**。
+ *
+ * ⚠️ 新代码一律传 `Key.pitchMidi`（notifyKeyPress / playFeedback /
+ * triggerSynthNoteAt 的第三参）。本函数只在「调用方拿不到键对象」时兜底 ——
+ * 键集恒为「从键域起点 C3 起的连续半音序列」，所以兜底就是 `keyPitchAt`
+ * （**逐半音**，与键位矩阵上的真实音高逐点一致）。
+ *
+ * 旧实现兜底到「C4 起的自然音序列」（lane 1 → D4），在半音键集上会差
+ * 整整一个音 —— 那种偏差听着只是「有点不对」，极难定位。
+ */
+export function keyIndexToMidi(keyIndex: number): number {
+  return keyPitchAt(keyIndex);
 }
 
 /**
@@ -41,11 +48,11 @@ class FeedbackPiano {
     this.synth.connect(this.bus);
   }
 
-  play(keyIndex: number): void {
+  play(keyIndex: number, pitchMidi?: number): void {
     this.ensure();
     const synth = this.synth;
     if (!synth) return;
-    const freq = midiToHz(keyIndexToMidi(keyIndex));
+    const freq = midiToHz(pitchMidi ?? keyIndexToMidi(keyIndex));
     synth.triggerAttackRelease(freq, 0.5, Tone.now());
   }
 
@@ -90,16 +97,17 @@ export class TakeRecorder {
    * pressCount 为该键第几次按下（1-based），与 KeyMachine 游标历史一致。
    * 两段式时长捕获：按下时先记录事件（duration 留空 = 「未闭合」），
    * 待 UI pointerup 调用配对的 notifyKeyRelease 时补写 duration。
+   * @param pitchMidi 该键的固定音高（Key.pitchMidi）；缺省回落旧下标映射
    * @returns 记录到的事件；未在录制中返回 null
    */
-  notifyKeyPress(keyIndex: number, velocity = 1): TakeEvent | null {
+  notifyKeyPress(keyIndex: number, velocity = 1, pitchMidi?: number): TakeEvent | null {
     if (!this.running || keyIndex < 0) return null;
     const tSec = Math.max(0, getAudioContext().currentTime - this.startTime);
     const prev = this.pressCounts[keyIndex] ?? 0;
     const pressCount = prev + 1;
     this.pressCounts[keyIndex] = pressCount;
-    // 音高自动从 keyIndex 生成：do=C4=60，按大调音阶跨八度铺开
-    const pitch = keyIndexToMidi(keyIndex);
+    // 音高 = 键的固定身份（pitchMidi），与键的位置/增删无关
+    const pitch = pitchMidi ?? keyIndexToMidi(keyIndex);
     // duration 刻意不设置：保持 undefined 直到 notifyKeyRelease 闭合
     const ev: TakeEvent = { keyIndex, pressCount, tSec, velocity, pitch };
     this.events.push(ev);
@@ -110,9 +118,10 @@ export class TakeRecorder {
    * 播放钢琴反馈音（跟弹参考音）。
    * 只有需要"跟弹"语义的调用方显式调用 —— 目前是"录制中且采样已发声"。
    * 独立于 notifyKeyPress，避免 recorder 内部发声与调用方的发声叠加。
+   * @param pitchMidi 该键的固定音高（Key.pitchMidi）；缺省回落旧下标映射
    */
-  playFeedback(keyIndex: number): void {
-    this.feedback.play(keyIndex);
+  playFeedback(keyIndex: number, pitchMidi?: number): void {
+    this.feedback.play(keyIndex, pitchMidi);
   }
 
   /**

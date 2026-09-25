@@ -4,7 +4,7 @@
  *  - 水合门控的 KeyMachine 创建（machineRef 单例）；
  *  - cursors 游标状态 + syncCursors / afterMutation 同步；
  *  - handlePress：trigger + 游标回写 + 空键一次性提示（全局 toast）；
- *  - resetAllCursors / resetRowCursor / applyKeyCount；
+ *  - resetAllCursors / resetRowCursor / applyKeyCount（音域格数）；
  *  - 进入页面预热全部序列素材缓存（README §3）。
  */
 
@@ -28,7 +28,13 @@ export interface KeyMachineController {
   prewarmReady: boolean;
   /** 演奏触发：返回 MemeKey 本地闪灯摘要；机器未就绪返回 null */
   handlePress: (keyIndex: number) => MemeKeyPressResult | null;
-  /** 修改键数并同步机器/游标 */
+  /**
+   * 修改**音域格数**（= 键盘上那串连续半音序列的长度）并同步机器/游标。
+   *
+   * 只增删序列末尾，**不动任何幸存键的音高** —— 老工程永远不会跑音。
+   * 关闭半音键时，store 会自动把目标格数对齐到下一个**可见的白键**
+   * （否则「＋」会加到看不见的黑键上，用户点了没反应）。
+   */
   applyKeyCount: (n: number) => void;
   /** 所有键游标归位（引擎 + store 双写） */
   resetAllCursors: () => void;
@@ -175,5 +181,13 @@ export function useKeyMachineController(activeKeys?: Key[]): KeyMachineControlle
     syncCursors();
   }, [syncCursors]);
 
-  return { cursors, prewarmReady, handlePress, applyKeyCount, resetAllCursors, resetRowCursor, syncAfterMutation };
+  return {
+    cursors,
+    prewarmReady,
+    handlePress,
+    applyKeyCount,
+    resetAllCursors,
+    resetRowCursor,
+    syncAfterMutation,
+  };
 }

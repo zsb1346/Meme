@@ -105,7 +105,15 @@ interface AckMessage {
 
 // ---- AI 模型懒加载 ----
 
-const MODEL_URL = '/model.json';
+/**
+ * AI 模型（tfjs）路径，同样只放 `public/` 下、只能走 BASE_URL。
+ *
+ * 写死 `/model.json` 时，站点部署到子目录会 404 → AI 音高一路直接失效
+ * （UI 上表现为一直停在「首次加载 AI 模型…」）。权重清单里那个
+ * `group1-shard1of1.bin` 是**相对 model.json** 解析的，所以只要这里对了，
+ * shard 会自动跟上，不需要单独配。
+ */
+const MODEL_URL = `${import.meta.env.BASE_URL}model.json`;
 
 // 动态 import 的类型，避免顶层静态引入拉进 bundle
 type BasicPitchModule = typeof import('@spotify/basic-pitch');

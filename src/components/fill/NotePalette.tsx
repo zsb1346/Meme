@@ -64,12 +64,7 @@ import { toast } from '../ui/toast';
 import { registerShortcut } from '../ui/shortcuts';
 import { PitchDisplay } from './PitchDisplay';
 import { EnginePicker } from './EnginePicker';
-import {
-  laneToSolfege,
-  laneToOctaveGroup,
-  midiToNoteName,
-  midiNoteToRawLane,
-} from '../../model/midi-import';
+import { midiNoteName } from '../../model/pitch-map';
 import {
   IconAlert,
   IconCheck,
@@ -255,15 +250,10 @@ function PaletteBody({
   const keyMissing = !ev || !keys[ev.keyIndex];
   const keyLabel = ev ? (keys[ev.keyIndex]?.label ?? `键${ev.keyIndex + 1}`) : '—';
   /*
-    事件所在键道 —— 与卷帘键盘栏**同一套算法**（midiNoteToRawLane + 音域平移）。
-    `ev.pitch` 是录制/导入时写入的原始 MIDI；缺省时退回 keyIndex。
+    事件所在键道 = ev.keyIndex（卷帘的行就是键下标，无需再绕音高推算）。
+    键的音名 = keys[keyIndex].pitchMidi（迁移后必有；缺省回落 C4）。
   */
-  const editingLane = ev
-    ? (() => {
-        const raw = midiNoteToRawLane(ev.pitch ?? 60 + ev.keyIndex);
-        return ((raw % Math.max(1, keys.length)) + Math.max(1, keys.length)) % Math.max(1, keys.length);
-      })()
-    : 0;
+  const keyPitchMidi = ev ? (keys[ev.keyIndex]?.pitchMidi ?? 60) : 60;
   const title = `装配第${eventIndex + 1}音 · ${keyLabel} · 第${ev?.pressCount ?? '?'}按`;
 
   const effectiveSample = effectiveSampleId
@@ -946,16 +936,11 @@ function PaletteBody({
           )}
 
           {/*
-            ══ 键位徽章（用户反馈：要看清楚这是 do/re/mi，不用左右来回找）══
+            ══ 键位徽章（要看清楚正在装配卷帘的哪一行，不用左右来回找）══
 
-            装配面板里最需要随时确认的一件事就是「我正在装配卷帘的哪一行」。
-            旧版只在标题里写了个小字「do」，而右侧音高读数又是「D#3 / fa」，
-            两边字号都不大 —— 用户得在左侧滚动列表、中间面板、右侧读数之间来回跳。
-
-            这里给一个**大号唱名徽章**：
-              · 唱名用大字号 + 强调色，一眼可辨；
-              · 顺带标出「键道 N（第 M 组）」，与卷帘键盘栏的八度分组对得上；
-              · 音名取事件的原始 MIDI（含黑键），与右侧 PitchDisplay 的读数互相印证。
+            左侧大字 = 键的音名（Key.pitchMidi → C4 / D#5），
+            与卷帘键盘栏逐行标注的音名严格同源 —— 用户对照一次就够。
+            右侧 = 事件自身的音高（含导入 MIDI 的黑键），与 PitchDisplay 互证。
           */}
           {!keyMissing && ev && (
             <div className="flex shrink-0 items-center gap-3 rounded-sm bg-ink-950 px-3 py-2 shadow-[inset_0_0_0_1px_rgb(var(--line))]">
@@ -965,20 +950,20 @@ function PaletteBody({
               />
               <span className="flex min-w-0 flex-col">
                 <span className="font-mono text-[22px] font-bold leading-none tracking-[-0.02em] text-flame-300">
-                  {laneToSolfege(editingLane)}
+                  {midiNoteName(keyPitchMidi)}
                 </span>
                 <span className="mt-1 whitespace-nowrap font-mono text-micro tabular-nums text-label-muted">
-                  键道 {editingLane}
-                  <span className="mx-1 text-label-faint">·</span>第 {laneToOctaveGroup(editingLane) + 1} 组
+                  键道 {ev.keyIndex}
+                  <span className="mx-1 text-label-faint">·</span>第 {ev.pressCount} 按
                 </span>
               </span>
               <span className="min-w-2 flex-1" />
               <span className="flex shrink-0 flex-col items-end">
                 <span className="font-mono text-body font-semibold tabular-nums text-label-hi">
-                  {midiToNoteName(ev.pitch ?? 60)}
+                  {midiNoteName(ev.pitch ?? keyPitchMidi)}
                 </span>
                 <span className="font-mono text-micro tabular-nums text-label-muted">
-                  第 {ev.pressCount} 按
+                  事件音高
                 </span>
               </span>
             </div>

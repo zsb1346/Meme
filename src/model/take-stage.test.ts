@@ -12,13 +12,18 @@ import type { Project, Take, TakeEvent } from './types';
 
 function project(): Project {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     id: 'p',
     name: 'p',
     samples: [],
+    /*
+      ⚠️ `pitchMidi` 必须写上：迁移后**任何**工程都带显式音高（键集是
+      从 C3 起的连续半音序列），而缺了它 `keyPitch` 会回落到旧映射
+      （lane 0 = C4 = 60），与本项目的键域起点 C3 = 48 差一个八度。
+    */
     keys: [
-      { id: 'k0', label: 'do', sequence: [{ sampleId: 'global' }], cursor: 0 },
-      { id: 'k1', label: 're', sequence: [], cursor: 0 },
+      { id: 'k0', label: 'C3', pitchMidi: 48, sequence: [{ sampleId: 'global' }], cursor: 0 },
+      { id: 'k1', label: 'C#3', pitchMidi: 49, sequence: [], cursor: 0 },
     ],
     takes: [],
     effects: {} as Project['effects'],
@@ -71,7 +76,8 @@ describe('buildTakeKeys', () => {
       expect(key.cursor).toBe(0);
     }
     // 键本体（id/label 等）保持不变，只清空序列
-    expect(keys[0].label).toBe('do');
+    expect(keys[0].label).toBe('C3');
+    expect(keys[0].pitchMidi).toBe(48);
   });
 
   it('旧档事件缺 sampleId 不再回退全局 Key.sequence：骨架 = 静音（一声源规则）', () => {

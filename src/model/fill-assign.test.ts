@@ -89,6 +89,7 @@ function makeProject(keys: Key[]): Project {
       keyCount: 8,
       keyBindings: {},
       autoTuneEnabled: true,
+      semitoneModeEnabled: false,
     },
     updatedAtMs: 0,
   };

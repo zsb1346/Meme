@@ -50,6 +50,7 @@ import type {
 } from 'react';
 import type { Take, TakeEvent } from '../../model/types';
 import { useStore } from '../../model/store';
+import { midiNoteName } from '../../model/pitch-map';
 import { getTokens } from '../../styles/getTokens';
 import { getAudioContext, ensureAudioStarted } from '../../engine/core';
 import { triggerSynthPitchAt } from '../../engine/synth-preview';
@@ -71,7 +72,6 @@ import {
   hitResizeHandle,
   hitTest,
   isBlackPitch,
-  laneLabel,
   laneOf,
   pickTimeStep,
   pitchOfLane,
@@ -91,6 +91,19 @@ export interface RollCanvasProps {
   take: Take;
   keyCount?: number;
   keyLabels?: string[];
+  /**
+   * 各键道行的权威音高（Key.pitchMidi 的逐行投影，与 keyLabels 同序）。
+   * 拖块换道 / 插入音符 / ↑↓ 换道时写入事件的 pitch 都取它；
+   * 缺省回落旧下标映射（仅演示/测试场景）。
+   */
+  lanePitches?: number[];
+  /**
+   * 半音键已收起（演奏键盘上不摆黑键）。
+   *
+   * 卷帘**仍然显示全部音高行**（藏起一行 = 藏起那行上的音符），
+   * 但把黑键标成「关着」：钢琴栏画空心轮廓。见 `renderer.ts`。
+   */
+  blackLanesDisabled?: boolean;
   onChange?(updatedTake: Take): void;
   playing?: boolean;
   playheadSec?: number;
@@ -195,6 +208,10 @@ export function useRollController(props: RollCanvasProps) {
   useEffect(() => {
     srcRef.current = props;
   });
+
+  /** 行的权威音高：lanePitches（Key.pitchMidi 投影）优先，缺省回落旧下标映射 */
+  const lanePitchAt = (lane: number): number =>
+    srcRef.current.lanePitches?.[lane] ?? pitchOfLane(lane);
 
   const take = props.take;
   const takeRef = useRef(take);
@@ -316,7 +333,8 @@ export function useRollController(props: RollCanvasProps) {
         ) {
           return prev;
         }
-        const label = srcRef.current.keyLabels?.[lane] ?? laneLabel(lane);
+        const label =
+          srcRef.current.keyLabels?.[lane] ?? midiNoteName(pitchOfLane(lane));
         return {
           count: 1,
           single: {
@@ -557,6 +575,8 @@ export function useRollController(props: RollCanvasProps) {
       playingIndex,
       playheadSec: ph,
       keyLabels: p.keyLabels,
+      lanePitches: p.lanePitches,
+      blackLanesDisabled: p.blackLanesDisabled,
       colors: getTokens(),
       marquee: marqueeRef.current,
       ghost: ghostRef.current,
@@ -1005,7 +1025,7 @@ export function useRollController(props: RollCanvasProps) {
             ...buf[i],
             tSec: Math.max(0, o.tSec + dtSec),
             keyIndex: newLane,
-            pitch: pitchOfLane(newLane),
+            pitch: lanePitchAt(newLane),
           };
         }
         dragBufRef.current = buf;

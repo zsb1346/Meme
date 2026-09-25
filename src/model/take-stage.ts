@@ -1,4 +1,5 @@
 import { keyIndexToMidi } from '../engine/recorder';
+import { keyPitch } from './pitch-map';
 import { uid } from '../utils/uid';
 import type { Key, Project, SampleId, SampleRef, Take, TakeEvent } from './types';
 
@@ -161,7 +162,7 @@ export function seedTakeFromKeys(project: Project, name = '演奏 1'): Take {
         pressCount: ++pressCount,
         tSec: globalCounter++ * 0.25,
         sampleId: ref.sampleId,
-        pitch: ref.targetPitchMidi ?? keyIndexToMidi(keyIndex),
+        pitch: ref.targetPitchMidi ?? keyPitch(key, keyIndex),
       };
       if (ref.pitchDelta) event.pitchDelta = ref.pitchDelta;
       if (ref.timeFactor && ref.timeFactor !== 1) event.timeFactor = ref.timeFactor;

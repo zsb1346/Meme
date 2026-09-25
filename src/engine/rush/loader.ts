@@ -108,8 +108,21 @@ export interface WasmDecoded {
   pitchHz: number;
 }
 
-/** wasm 静态资源路径（public/ 根，静态托管与 worker fetch 均可解析）。 */
-export const HAJIMI_WASM_URL = '/hajimi_audio.wasm';
+/**
+ * wasm 静态资源路径。
+ *
+ * ⚠️ **必须走 `import.meta.env.BASE_URL`，不能写死 `/hajimi_audio.wasm`。**
+ *
+ * `public/` 下的文件不在模块图里，没有 `new URL('...', import.meta.url)` 可用的
+ * 相对基准，所以只能靠这个常量。写死根路径的话，站点一旦部署到**子目录**
+ * （`https://host/meme-studio/`），wasm 会 404 —— 而 wasm 是解码与变调的内核，
+ * 一挂就是「什么都放不出来」。
+ *
+ * `BASE_URL` 由 Vite 按 `vite.config.ts` 的 `base` 静态注入，**始终以 `/` 结尾**，
+ * 所以这里直接拼接。搬迁站点只改 `base` 一处，代码不用动。
+ * （根路径部署时 BASE_URL === '/'，行为与原来的写死值完全一致。）
+ */
+export const HAJIMI_WASM_URL = `${import.meta.env.BASE_URL}hajimi_audio.wasm`;
 
 let promise: Promise<HajimiWasm> | null = null;
 

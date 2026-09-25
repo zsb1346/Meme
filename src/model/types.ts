@@ -53,8 +53,14 @@ export interface SampleRef {
  */
 export interface Key {
   id: KeyId;
-  /** 展示标签（如 do / re / mi 或自定义名） */
+  /** 展示标签（默认 = 音名如 C4 / D#3；用户可自定义） */
   label: string;
+  /**
+   * 键的固定音高（MIDI 音号）—— **键的身份字段，与位置无关**。
+   * 写入后不再变：删除/截断其他键不影响它；半音开关也不改它（保住音）。
+   * 可选仅为兼容「未经 migrateProject 的旧数据」；正常路径下 hydrate 后必有值。
+   */
+  pitchMidi?: number;
   /** 有序素材槽位；空序列 = 哑键（触发不出声，游标保持不动） */
   sequence: SampleRef[];
   /** 当前游标：trigger 后 cursor = (cursor+1) % sequence.length */
@@ -261,17 +267,41 @@ export interface Settings {
   pitchNormalizationEnabled: boolean;
   /** 归一目标基准音高，默认 C4 = 261.6256 Hz（do） */
   referencePitchHz: number;
-  /** 演奏台键数（8 / 15 / 自定义） */
+  /**
+   * 音域**格数**（半音格），1..61。
+   *
+   * 键集恒为「从键域起点（C3 = 48）起的**连续半音序列**」，所以这个数字
+   * 同时也是键数组长度；它与半音键开关**完全无关**（开关只决定露出多少键）。
+   */
   keyCount: number;
   /** 键盘绑定：keyIndex → KeyboardEvent.key。两页共享，随工程持久化。 */
   keyBindings: Record<number, string>;
   /** 全局自动修音：开 = 播放/导出时把素材对齐到事件音高；关 = 只用手动偏移 */
   autoTuneEnabled: boolean;
+  /**
+   * **半音键（黑键）显示开关** —— 纯视图状态。
+   *
+   * 开 = 键盘上摆出全部黑键（每八度 12 键）；关 = 只摆白键（每八度 7 键）。
+   *
+   * ⚠️ 半音键**默认就在后台铺好了**（键集本来就是连续半音序列），
+   * 这个开关不添加、不删除、不移动任何键 —— 不改音高、不改键数、
+   * 不改 Take 里的音符、不改按键绑定。关掉再打开，一个音都不跑。
+   *
+   * （旧语义是「追加键取哪条序列」，于是关掉开关后已存在的黑键会被当白键
+   *   挤掉别人的位置 —— 那是布局层读了开关导致的，已废弃。）
+   */
+  semitoneModeEnabled: boolean;
 }
 
 /** Project 工程 —— 全部状态容器、持久化单位 */
 export interface Project {
-  schemaVersion: 1;
+  /**
+   * 存档结构版本。
+   *   1 → 2（2026-09-25）：键集从「用户攒出来的键」升级为
+   *   「后台铺好的连续半音序列」，Take 事件的 keyIndex 与按键绑定
+   *   必须按音高重新编号（否则音符会整体错位到隔壁键）。
+   */
+  schemaVersion: 1 | 2;
   id: string;
   name: string;
   samples: Sample[];

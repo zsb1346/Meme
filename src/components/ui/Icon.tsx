@@ -283,6 +283,18 @@ const PATHS = {
       </>
     ),
   },
+
+  /* ── 合规入口（AGPL-3.0 §13 要求网络用户能拿到源码）── */
+  /** 源码：尖括号代码符号 */
+  source: {
+    d: (
+      <>
+        <path d="M9 8L5 12l4 4" />
+        <path d="M15 8l4 4-4 4" />
+        <path d="M13.5 5.5l-3 13" />
+      </>
+    ),
+  },
 } satisfies Record<string, IconDef>;
 
 /** 图标名 */
@@ -372,3 +384,6 @@ export const IconFullscreen = createIcon('fullscreen');
 export const IconChevronDown = createIcon('chevronDown');
 export const IconChevronRight = createIcon('chevronRight');
 export const IconGrip = createIcon('grip');
+
+/* ── 合规入口 ── */
+export const IconSource = createIcon('source');

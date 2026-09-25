@@ -18,6 +18,16 @@ import type {
 import { uid } from '../utils/uid';
 import { DEFAULT_REVERB_SETTINGS } from '../engine/effect-units/reverb-defaults';
 import { cacheBuffer, decodeAudioBlobShared, dropCachedBuffer } from '../engine/sample-player';
+import {
+  KEY_BASE_MIDI,
+  KEY_DOMAIN_MAX_COUNT,
+  KEY_MAX_MIDI,
+  isDiatonicMidi,
+  keyPitch,
+  keyPitchAt,
+  legacyPitchOfLane,
+  midiNoteName,
+} from './pitch-map';
 
 // ---------------------------------------------------------------------------
 // 默认值
@@ -133,10 +143,80 @@ function migrateEqFromLegacy(raw: unknown): EqSettings {
 export function migrateProject(raw: Project | null): Project | null {
   if (!raw) return null;
   const p = raw;
-  // 老存档的 settings 可能缺 keyBindings（既有逻辑，保留）
-  if (!p.settings?.keyBindings) {
-    p.settings = { ...p.settings, keyBindings: {} };
+
+  /*
+    settings 一律「默认值打底 + 存档覆盖」：新增字段（如 semitoneModeEnabled）
+    在老存档里是 undefined，不补的话 UI 读到 undefined 会按 false 走 ——
+    多数情况恰好等价，但「字段存在但为 undefined」与「字段不存在」在
+    序列化回写时会分叉，统一在这里落地。
+  */
+  p.settings = {
+    ...DEFAULT_SETTINGS,
+    ...p.settings,
+    keyBindings: p.settings?.keyBindings ?? {},
+  };
+
+  /*
+    ══ 键迁移（2026-09-25 第二次定稿）══
+
+    键集的语义从「用户一格格攒出来的键」升级为
+    「**后台默认就铺好的连续半音序列**」（用户原话：「默认应该在后台上就
+    加载好了那些半音按键，半音只是控制是否开启」）。
+
+    于是迁移要做两件事：
+
+    ① **补全音域**：老键集只铺了它用得着的那些音（自然音键集里没有黑键，
+       老半音键集里也未必连续），这里按 [base, hi] 铺满**每一个半音格**，
+       老键按 pitchMidi 原地保留（音高、装配、游标、自定义标签全不动）。
+
+    ② **重映射下标**：键的身份没变，但**下标变了**（中间插进了黑键）。
+       Take 事件与按键绑定都是**按下标**存的，必须跟着搬 ——
+       漏掉这一步，老工程里所有的音符都会落到隔壁键上，
+       而且看上去「音符都在、就是全跑调」，是最难查的那类事故。
+
+    本函数**幂等**：键集已经是连续半音序列时，补全结果与原键集逐格相同、
+    重映射是恒等映射，跑多少次都没有变化。
+  */
+  const normalized = (p.keys ?? []).map((k, i) => {
+    const pitchMidi =
+      typeof k.pitchMidi === 'number' && Number.isFinite(k.pitchMidi)
+        ? k.pitchMidi
+        : legacyPitchOfLane(i);
+    // 标签换轨：仍是出厂默认唱名（do / do' / do″…）的改写为音名；
+    // 用户自己改过的标签（不匹配出厂图案）原样保留。
+    const label = LEGACY_DEFAULT_LABEL.test(k.label ?? '') ? midiNoteName(pitchMidi) : k.label;
+    return { ...k, pitchMidi, label };
+  });
+
+  const { keys, indexRemap } = completeKeySet(normalized);
+  p.keys = keys;
+  p.settings.keyCount = keys.length;
+
+  /*
+    重映射 Take 事件。优先用事件自带的 `pitch`（绝对音高，与下标无关）——
+    它从 2026-09 起就在写；没有时才回退到「老下标 → 新下标」映射。
+  */
+  p.takes = (p.takes ?? []).map((t) => ({
+    ...t,
+    events: (t.events ?? []).map((ev) => {
+      // 新键集起点（补齐后 keys[0] 必定存在 —— 上面 completeKeySet 保证非空）
+      const baseMidi = keys[0]?.pitchMidi;
+      const byPitch =
+        typeof ev.pitch === 'number' && Number.isFinite(ev.pitch) && baseMidi !== undefined
+          ? Math.round(ev.pitch) - baseMidi
+          : null;
+      const next = byPitch ?? indexRemap.get(ev.keyIndex) ?? ev.keyIndex;
+      return next === ev.keyIndex ? ev : { ...ev, keyIndex: next };
+    }),
+  }));
+
+  /* 按键绑定同样是按下标存的，一并搬；指向已消失键的绑定直接丢弃 */
+  const bindings: Record<number, string> = {};
+  for (const [oldIdxRaw, keyName] of Object.entries(p.settings.keyBindings ?? {})) {
+    const next = indexRemap.get(Number(oldIdxRaw));
+    if (next !== undefined && next >= 0 && next < keys.length) bindings[next] = keyName;
   }
+  p.settings.keyBindings = bindings;
 
   /*
     四级效果设置逐级「默认值打底 + 存档覆盖」。
@@ -161,26 +241,78 @@ export function migrateProject(raw: Project | null): Project | null {
 
 export const DEFAULT_SETTINGS: Settings = {
   pitchNormalizationEnabled: true,
-  referencePitchHz: 261.6255653, // C4 = do
-  keyCount: 14,
+  referencePitchHz: 261.6255653, // C4 = 261.63 Hz
+  /*
+    默认音域 = **2 个八度 = 24 个半音格**（C3–B4）。
+    关掉半音键时键盘上恰好是 14 个白键 —— 与旧版默认观感逐键一致，零视觉回归；
+    打开半音键就多出 10 个黑键，音域一点没变。
+  */
+  keyCount: 24,
   keyBindings: {},
   autoTuneEnabled: true,
+  /** 半音键（黑键）是否显示 —— 纯视图开关，不参与键集/音域的任何计算 */
+  semitoneModeEnabled: false,
 };
 
-const SOLFEGE = ['do', 're', 'mi', 'fa', 'sol', 'la', 'si'] as const;
+/** 出厂默认标签图案（旧唱名制）：do / do' / do″…；迁移时仅改写匹配此图案的 */
+const LEGACY_DEFAULT_LABEL = /^(?:do|re|mi|fa|sol|la|si)['′]*$/;
 
-function defaultKeyLabel(index: number): string {
-  // 每跨一个八度追加一个撇号：0-6 → do…si；7-13 → do'…si'；14-20 → do''…
-  return SOLFEGE[index % 7] + "'".repeat(Math.floor(index / 7));
+/**
+ * 新建 count 个键：**连续半音序列**，从键域起点 C3 起一格一个半音。
+ *
+ * ⚠️ 这里**不再有「模式」参数**。旧实现按 `chromatic` 决定铺自然音还是半音，
+ * 于是「关掉开关后已存在的黑键被当白键、挤掉别人的位置」。现在键集与开关
+ * 彻底解耦：**默认就在后台上把半音键全部铺好**，开关只决定它们显不显示。
+ */
+export function createDefaultKeys(count: number): Key[] {
+  const n = Math.max(1, Math.min(KEY_DOMAIN_MAX_COUNT, Math.round(count)));
+  return Array.from({ length: n }, (_, i) => {
+    const pitchMidi = keyPitchAt(i);
+    return { id: uid(), label: midiNoteName(pitchMidi), pitchMidi, sequence: [], cursor: 0 };
+  });
 }
 
-export function createDefaultKeys(count: number): Key[] {
-  return Array.from({ length: count }, (_, i) => ({
-    id: uid(),
-    label: defaultKeyLabel(i),
-    sequence: [],
-    cursor: 0,
-  }));
+/**
+ * 把一个键集**补全成连续半音序列**（幂等）。
+ *
+ * 返回 `indexRemap`：老下标 → 新下标。**必须**用它把 Take 事件与按键绑定
+ * 一起搬过去 —— 键的身份（pitchMidi）不变，但下标会因为中间插进黑键而改变。
+ *
+ * 音域范围 = `[min(KEY_BASE_MIDI, 最低音), 最高音]`，一格不缺。
+ * 老键按音高原地保留（同音高的重复键只保留第一个）。
+ */
+export function completeKeySet(oldKeys: Key[]): {
+  keys: Key[];
+  indexRemap: Map<number, number>;
+} {
+  const indexRemap = new Map<number, number>();
+  if (oldKeys.length === 0) {
+    return { keys: createDefaultKeys(DEFAULT_SETTINGS.keyCount), indexRemap };
+  }
+  const pitches = oldKeys.map((k, i) => keyPitch(k, i));
+  const base = Math.min(KEY_BASE_MIDI, ...pitches);
+  const hi = Math.max(...pitches);
+  const span = Math.max(1, hi - base + 1);
+
+  const byPitch = new Map<number, Key>();
+  oldKeys.forEach((k, i) => {
+    const p = pitches[i];
+    if (!byPitch.has(p)) byPitch.set(p, k);
+    indexRemap.set(i, p - base);
+  });
+
+  const keys: Key[] = [];
+  for (let i = 0; i < span; i++) {
+    const p = base + i;
+    const existing = byPitch.get(p);
+    keys.push(
+      existing
+        ? { ...existing, pitchMidi: p }
+        : { id: uid(), label: midiNoteName(p), pitchMidi: p, sequence: [], cursor: 0 },
+    );
+  }
+  if (keys.length > KEY_DOMAIN_MAX_COUNT) keys.length = KEY_DOMAIN_MAX_COUNT;
+  return { keys, indexRemap };
 }
 
 export function createEmptyTake(name: string): Take {
@@ -195,7 +327,7 @@ export function createEmptyTake(name: string): Take {
 
 export function createDefaultProject(): Project {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     id: uid(),
     name: '未命名工程',
     samples: [],
@@ -257,7 +389,17 @@ interface AppState {
   // —— 全局设置 ——
   setPitchNormalization(enabled: boolean): void;
   setReferencePitchHz(hz: number): void;
+  /**
+   * 键数 = **音域格数**（半音格），1..61。键集恒为「起点起的连续半音序列」，
+   * 所以本操作只是把序列伸长/截短，**不动任何幸存键的音高**。
+   *
+   * ⚠️ 半音键关闭时，扩张会**自动越过黑键**停在下一个白键上 ——
+   * 否则「＋」会把音域扩到一个看不见的黑键上，用户点了半天毫无变化
+   * （详见 `nextVisiblePitch`）。
+   */
   setKeyCount(count: number): void;
+  /** 半音键（黑键）显示开关 —— 纯视图状态，不改键集、不改音域、不改音符 */
+  setSemitoneMode(enabled: boolean): void;
   setKeyBinding(keyIndex: number, key: string): void;
   clearKeyBinding(keyIndex: number): void;
   clearAllKeyBindings(): void;
@@ -468,20 +610,75 @@ export const useStore = create<AppState>()((set, get) => ({
 
   setKeyCount: (count) =>
     set((s) => {
-      const n = Math.max(1, Math.min(32, Math.round(count)));
-      const existing = s.project.keys.slice(0, n);
-      const padded = [
-        ...existing,
-        ...createDefaultKeys(n).slice(existing.length),
-      ];
+      const keys = [...s.project.keys];
+      if (keys.length === 0) return {};
+      const semitoneEnabled = s.project.settings.semitoneModeEnabled;
+      const base = keyPitch(keys[0], 0);
+
+      /*
+        上限一律用**与开关无关**的键域格数（61）。
+        旧实现按模式取上限（自然 36 / 半音 61），于是「半音下的 61 键工程 →
+        关掉开关 → 点一下键数」会把目标夹到 36 → 静默截断 25 个键。
+      */
+      let n = Math.max(1, Math.min(KEY_DOMAIN_MAX_COUNT, Math.round(count)));
+
+      /*
+        关闭半音键时，把目标格数**对齐到可见的白键格**。
+        否则「＋」可能把音域扩到一个**看不见的**黑键上 —— 用户连点五次，
+        键盘一次变化都没有（键集是后台铺好的，黑键只是不显示）。
+        收缩同理：减到黑键上会「减了没反应」，再减一下掉两个键。
+      */
+      if (!semitoneEnabled) {
+        if (n > keys.length) {
+          while (n < KEY_DOMAIN_MAX_COUNT && !isDiatonicMidi(base + n - 1)) n++;
+        } else if (n < keys.length) {
+          while (n > 1 && !isDiatonicMidi(base + n - 1)) n--;
+        }
+      }
+
+      // 收缩：直接截断 —— 幸存键的 pitchMidi 原样保留（键的身份是音高）
+      if (keys.length > n) keys.length = n;
+      /*
+        扩张：键集恒为「从 base 起的连续半音序列」，所以新键音高 = base + 下标，
+        既不用问模式、也不用读最后一个键（它必然是 base + length − 1）。
+      */
+      while (keys.length < n) {
+        const pitchMidi = base + keys.length;
+        if (pitchMidi > KEY_MAX_MIDI) break;
+        keys.push({
+          id: uid(),
+          label: midiNoteName(pitchMidi),
+          pitchMidi,
+          sequence: [],
+          cursor: 0,
+        });
+      }
       return {
         project: touch({
           ...s.project,
-          settings: { ...s.project.settings, keyCount: n },
-          keys: padded.map((k) => ({ ...k, cursor: k.cursor })),
+          settings: { ...s.project.settings, keyCount: keys.length },
+          keys,
         }),
       };
     }),
+
+  /**
+   * 半音键（黑键）显示开关 —— **纯视图状态**。
+   *
+   * ⚠️ 它只改这一个布尔值：键集、音域、Take 里的音符、按键绑定**一个都不碰**。
+   * 关掉只是想「先不摆黑键」，不是把黑键删掉 —— 关掉再打开，一个音都不跑。
+   *
+   * （旧实现把「追加键取哪条序列」也塞进这个开关，于是关掉之后已存在的
+   *   黑键被当白键、挤掉 D3 的位置；用户实报「半音会被当做音符块挤占
+   *   其他的地方」。根因是布局层去读了这个开关。）
+   */
+  setSemitoneMode: (enabled) =>
+    set((s) => ({
+      project: touch({
+        ...s.project,
+        settings: { ...s.project.settings, semitoneModeEnabled: enabled },
+      }),
+    })),
 
   setKeyBinding: (keyIndex, key) =>
     set((s) => ({
