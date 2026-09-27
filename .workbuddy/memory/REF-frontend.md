@@ -569,3 +569,114 @@ headless + `--disable-gpu`（软件光栅）下，**稀疏场景也稳定 33.3ms
   证明不了「两根手指各自派发了 pointerdown」。**连接处必须实机测。**
 - 探针三个坑（焦点 / touchEnd 点语义 / `maxTouchPoints` 1..16）→ `2026-09-27.md §G`。
 
+## 12. 弹奏性能：缓存额度 / 预热 / 按键热路径（2026-09-27 加）
+
+用户实报「弹奏时卡、有时无声、性能利用不充分」。Rust 侧的根因与实测 →
+`REF-kernel.md §9`；这一节是**JS 侧**（缓存、预热、热路径）与**验收探针**。
+
+### 12.1 变换缓存额度必须按「字节」不按「条数」
+
+`rush/transform.ts::RUSH_CACHE_BUDGET_BYTES = 8MB`；`evictToBudget(m, budgetBytes, bytesOf)`
+是**纯函数**（node 可测，`rush/transform.test.ts` 9 条），三处共用：
+
+| 位置 | 缓存的是什么 |
+|---|---|
+| `rush/transform.ts` | wasm 内核的变换结果（键 = `pitch|time|mode`） |
+| `rush/autotune.ts` | 自动修音的另一套参数 |
+| `sample-player.ts::transformByExternalCached` | 第三方引擎结果（键 = `engineId|pitch|time`） |
+
+- 一条 = `buffer.length × buffer.numberOfChannels × 4`，**跨度两个数量级**：
+  0.15~0.45s 切片 58~173KB，3 分钟人声 66MB。
+- 旧的固定「每源 8 条」两头都不对：短素材 8 条装不下 12 键工作集 → LRU 抖动 →
+  **每次按键都重算整段变换**；长素材 8 × 66MB = 530MB 直接爆内存。
+- ⛔ **`while (total > budget && m.size > 1)` —— 至少保留一条**，
+  哪怕单条就超过整个额度（否则一条都留不住，等于没有缓存）。
+- 8MB 额度下：0.45s 素材约 48 条（够几十个键），4s 素材 5 条，3 分钟素材 1 条。
+- ⛔ `WeakMap` 的键是**源 AudioBuffer** → 源被回收时对应缓存整片自动失效，
+  不需要手工失效逻辑。
+
+### 12.2 预热：把卡顿挪到「用户还没开始弹」的时刻
+
+`prewarmBuffers`（解码）之后接 `prewarmKeyTransforms`（**整段变调，同步跑在主线程**）。
+两者共用同一个 `prewarmReady` 指示灯，接在 `useKeyMachineController` 的 effect 里。
+
+⭐ 实测（`probe-play-perf.mjs`，12 键 / 3 条 0.4s 素材）：**预热前**头几个键的按下耗时
+45~71ms、并伴随 77ms 主线程长任务；**预热后**同样的按下 **0.3~4.3ms、0 长任务**。
+
+⛔ 两条必须守住的（都踩了，症状都是「灯在说假话」）：
+
+1. **`prewarmKeyTransforms` 必须 `await ensureRushLoaded()` 再判 `isRushReady()`。**
+   旧写法直接 `if (!isRushReady()) return empty`，而调用方把这个空报告当
+   「预热完成」→ 灯写「音色已就绪」而**一条变换都没算**。
+   （实测：12 条全没算，补算一次 237ms。）
+2. **effect 开头必须 `setPrewarmReady(false)`。** effect 依赖 `[hydrated, blobs]`，
+   每次新增素材都会重跑，但旧写法只在末尾置 `true` 从不复位 →
+   新一轮预热正在阻塞主线程时灯还写着「就绪」。
+   → 违反的仍是那条老红线：**UI 文案必须描述实际内容**（§MEMORY §F）。
+
+其他约定：
+- 预热**只预热 `playSample` 首选的那个 mode**（默认 1 = PSOLA）。⛔ 预热不许自己挑引擎 ——
+  挑错了 key 对不上的表现是「白预热，从外面完全看不出来」。
+- `budgetMs` 默认 4000：61 键的工程可能要几十秒，**没有上限**的话灯一直亮着，比不预热还糟。
+  超时收工没有额外损失（没算到的那几个键退回「首次按会卡一下」）。
+- `isCancelled` 必须有：用户切走之后预热还在主线程一条条算 = **「切到别的页面反而更卡」**。
+- 单条字节数 `× 2 > 额度` 的直接跳过 —— 算出来也留不住，白付一次整段变换。
+
+### 12.3 按键热路径上不许有逐次求值的副作用（`handlePress` → `KeyMachine.trigger`）
+
+| 位置 | 旧写法 | 为什么是问题 |
+|---|---|---|
+| `key-machine-singleton.ts` | `destination` getter 每次 trigger 都调 `getMasterChain(settings)` | 该函数的语义是「传了 settings 就 **apply**」→ **每按一键重排整条效果链**（含一条新的 50ms 输出增益斜坡）。改用 `effects.ts::peekMasterChain()`（只看不建） |
+| `core.ts::ensureAudioStarted` | 无条件 `resume()` | 每次按键造一个 promise + 挂 `.catch` + 排一个微任务。**注释本来就写着「已解锁时为 no-op」，代码没做到** → `if (c.state !== 'running')` |
+| `key-machine.ts` | `console.log('[trigger]', {...})` | 全仓库**唯一**一处 `console.log`，正好在按键热路径上 |
+
+### 12.4 ⭐ 验收：`scripts/probe-play-perf.mjs`（14 项）
+
+三条**绝对量**判据（不需要"改前"基线 —— 旧代码必然爆表）：
+① 每次按下都起一个 buffer source（`start` 计数 == 按键数）；
+② 按下 → `start()` 的**同步**耗时 p95 < 50ms；
+③ 全程无长任务（`PerformanceObserver` + `longtask`）。
+另有 ④ **弹这一轮引起几次 wasm `hajimi_tx_run` 调用**（预热是否真的覆盖了它们）。
+
+埋点走 `Page.addScriptToEvaluateOnNewDocument`（**必须先于导航**，否则第一帧就漏掉）：
+`AudioContext.prototype.createBufferSource` 包一层给 `start` 计数；
+window 捕获相的 `pointerdown` 打点（早于 React 的 onPointerDown）；
+wasm 导出计数（见下）。
+
+实测：弹 12 键 **12/12 发声**，p95 **4.3ms**（热态 0.5ms），**0 长任务**，**0 次 wasm 重算**；
+连击 20 次 **20/20 发声**、0 长任务、0 重算。
+
+⛔ **三条坑，每条都伪装成产品 bug**：
+
+1. **`instance.exports.hajimi_tx_run` 不能直接赋值 —— 会 13 项假绿。**
+   WebAssembly 的 exports 属性只读，而 ESM 是严格模式 → 赋值抛 `TypeError`
+   被 `catch` 吞掉 → 计数恒 0 → 所有「wasm 调用 == 0」的断言变成**永远为真**。
+   改法：`for (const k of Object.keys(ex)) wrapped[k] = ex[k]` 复制一份，
+   把 `hajimi_tx_run` 包一层，再把 `instance` 换成 `{ exports: wrapped }` 交回调用方。
+   **⭐ 并且必须加「埋点自检」**：用一个必定没被算过的音高比强制造一次变换，
+   计数不动就直接判失败。**探针绿得可疑比红更危险。**
+   （同一个坑在自检里又踩了一次：自检早于应用预热，得先 `await ensureRushLoaded()`，
+   否则自检把自己的时序问题报成「埋点坏了」。）
+2. **目标键必须取自页面上真实渲染的 `data-key-index`。** 关闭半音键时键区是
+   **白键布局**（下标跳黑键：0,2,4,5,7,9,11,12,14,16,17,19…）；
+   照 `0..11` 播种会有 5 个键真没装事件 —— 而它看起来**和用户报的「无声」一模一样**。
+   另外：造素材必须走 store 自己的 `addSampleFromFile`（拿 `{ ok, sampleId }`，
+   不是素材对象），不要自己拼 `project.samples`。
+3. **按下与 start 必须按 keyIndex 配对。** 按下标顺序配（`pressAt[i] ↔ startsAt[i]`）时，
+   只要有一个键没发声，后面全体错位 → 读出一串看着很合理的 87ms，实际是错位垃圾。
+   归因靠埋点里记的 `lastPress.i`。
+   还有：**「预热/就绪」不能靠轮询赌运气** —— 只换 Take 不动 `blobs` 不会让预热 effect
+   重跑，探针会把自己「没触发 effect」说成「指示灯说谎」。解法是**让演奏台重新挂载**
+   （导航到别的页再回来），这也正是用户的真实路径。
+
+### 12.5 定向变异（两处，都先红再修回）
+
+- `prewarmKeyTransforms` 里插 `if (i % 2 === 1) continue;` →
+  判据④红：**`wasm 调了 6 次`**，且慢的正好是被跳过的 6 个键（6.4/3.8/6.6/6.9/2.1/2.3ms）。
+- 自检那一条本身也验证过：把埋点改回直接赋值 → 自检红（计数 0）。
+
+⚠️ **`warmed` 计数包含缓存命中**（`transformBuffer` 命中直接返回，`warmed++` 照样执行）
+→ 「`warmed === 0`」**不是**判据。唯一可信的是 wasm 调用次数。
+诊断步骤里那条「第二次预热还要跑几次 wasm」同理：**确定性漏一半的 bug 它照样读到 0**
+（实测确认），真正的守卫是判据④。
+

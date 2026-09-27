@@ -156,3 +156,100 @@ worker 死掉时 UI **永远停在「首次加载 AI 模型…」**—— 把一
 
 **降级不许污染数据**：JS 退路的结果**不写 `store.detectedPitchHz`、也不写内存缓存** ——
 把降级值写进工程 = 把一次**暂态故障**永久固化进数据里。
+
+## 9. 弹奏性能：分析结果复用 + YIN 提前终止（2026-09-27 加）
+
+背景：用户实报「弹奏时卡、有时无声、性能利用不充分」，要求「提升好几个倍数量级」。
+
+### 9.1 瓶颈就是「每次都重算只依赖源素材的那一段」
+
+`hajimi_tx_run` mode=1 的前两步 —— `track_pitch(x, sr)`（YIN 逐帧）与
+`detect_marks(x, frames, sr)` —— **只依赖源素材**，与 `pitch` / `time` 无关，
+却是每次调用都从头算一遍。`wasm/src/yin_core.rs:6-8` 早就写着
+
+> 「（实测）track_pitch + detect_marks 占 mode=1 总耗时的 **~78%**」
+
+**但从没人跨调用复用它。** 首次实测（`scripts/_perf-psola.mjs`，5s 素材）：
+PSOLA 2124ms / SOLA 368ms → YIN 净成本 **1756ms（83%）**。
+弹奏时每个键一个独立音高 → 每次按键把同一段素材的 YIN 重跑一遍。
+
+### 9.2 `psola.rs::analysis_for` —— 按内容指纹复用
+
+```rust
+pub struct Analysis { frames: Rc<Vec<PitchFrame>>, marks: Rc<Vec<Mark>>, voiced: usize }
+const ANALYSIS_CACHE_CAP: usize = 48;   // thread_local 里一个 Vec，命中挪到末尾
+fn fingerprint(x: &[f32], sr: f32) -> u64   // FNV-1a，**遍历全部样点**
+```
+
+四条硬约束（每条都对应一个不报错的错法）：
+
+1. **指纹必须覆盖全部样点，不许抽样。** 抽样哈希在「两段不同素材恰好被抽到的点相同」
+   时给出同一指纹 → 复用**另一段素材的音高轨迹** → 输出错得莫名其妙且不报错。
+2. **`voiced` 必须一起缓存。** 它用来填 `LAST_VOICED`（判定「静默空转」）；
+   frames 复用了而 voiced 现算的话，命中那一次会把 voiced 报成 0 →
+   每次重复按键都被判成静默失效、降级到 SOLA —— 症状伪装成
+   **「第二次按同一个键音色变了」**。
+3. **返回 `Rc` 而不是借用**：调用方持有期间缓存条目可能被换出（引用计数兜住数据）。
+4. **缓存条目只按源样点 + 采样率索引**，与 pitch/time 无关。守卫
+   `same_source_different_pitches_share_one_analysis` 换 5 个音高后断言
+   `analysis_cache_len() == 1` —— **只比输出的话，删掉缓存照样全绿**。
+
+### 9.3 `yin_core.rs` —— 差分/CMND/阈值搜索交错，命中即止
+
+**定理**：CMND 的归一化分母 `running = Σ_{k=1..tau} d[k]` **只累积到当前 tau**，
+所以 `cmnd[tau]` 只取决于 `d[1..=tau]`；而阈值搜索本来就是找**第一个**过阈的 tau
+→ 命中之后剩下的 d 全是白算。
+
+```rust
+cmnd[0] = 1.0; let mut running = 0.0;
+let mut tau = 1;
+while tau <= max_tau {
+    step_tau!(tau);                       // 算 d[tau] → running → cmnd[tau]
+    if tau >= min_tau && cmnd[tau] < threshold {
+        let mut t = tau;
+        while t + 1 <= max_tau {           // 只继续算到局部最小
+            if done < t + 1 { step_tau!(t + 1); }
+            if cmnd[t + 1] < cmnd[t] { t += 1; } else { break; }
+        }
+        tau_est = Some(t); break;
+    }
+    tau += 1;
+}
+```
+
+**这不是近似**：累加顺序完全一致，提前停止时算出的每个 cmnd **逐位相同**
+（`_probe-psola-cache.mjs` 逐样本比对确认）。
+
+⚠️ 用 `macro_rules!` 而不是闭包 —— 闭包会同时可变借用 `diff`/`cmnd` 与 `running`，
+借用检查过不去。`let mut done = 0usize;` 需要 `#[allow(unused_assignments)]`
+（初值在任何路径下都会被第一次 `step_tau!` 覆盖，但「一条都还没算」这个状态本身需要它）。
+
+### 9.4 实测（`scripts/_probe-psola-cache.mjs`，同进程 A/B、逐样本 bit-exact）
+
+| 场景 | 改前 | 改后 | 加速 |
+|---|---|---|---|
+| ① 顺序弹 12 键 | 2785ms | **777ms** | 3.6× |
+| ② 再按一遍 | 2837ms | **40ms** | 70.9× |
+| ③ 同键连按 20 | 6941ms | **111ms** | 62.6× |
+| ④ 两键来回 20 | 6559ms | **96ms** | 68.0× |
+| ⑤ 长素材 4 音高 | 4766ms | **618ms** | 7.7× |
+| ⑥ 另一条映射 | 1188ms | **157ms** | 7.6× |
+
+改前每次按键恒 ~300ms；改后逐次 `382,148,201,9,6,4,5,4,4,7,5,4` ——
+只剩**三个素材各自首次**付一次分析。① 之所以只有 3.6×，是因为它本来就含
+三次「素材首次」；②~④ 才是稳态。
+
+### 9.5 探针本身的四条坑（`_probe-psola-cache.mjs` 头注释里也写了）
+
+- ⛔ **恒等短路**：`pitch≈1 && time≈1` 时 `apply_planar_inner` 与 `transformBuffer`
+  都直接返回/拷贝源。测缓存时**音高比不许取到 1.0**，否则那一段是在量 memcpy。
+- ⛔ **A/B 必须两个独立实例**（`new WebAssembly.Instance`）。
+  共用实例时 B 会享受 A 的缓存，量出来的「改前」是假的。
+- ⛔ **A 全跑完再跑 B**，不许逐步交替 —— 交替会系统性偏袒后跑者（CPU 缓存）。
+- ⛔ 探针**绕过 JS 侧缓存**，只量 Rust；用户体感的证据在
+  `scripts/probe-play-perf.mjs`。
+
+**没复现出来的那一段要写明白**：`probe-play-perf.mjs` 是「播种 → 切页重挂载」，
+始终在 wasm 已加载之后才开始预热，所以它**覆盖不到**「冷启动 + 已有工程、
+预热跑在 WASM 加载完成之前」那个竞态窗口 —— 那个窗口靠 `ensureRushLoaded()` 的
+代码审查 + 逻辑推理收口，不是靠探针。

@@ -165,3 +165,32 @@
   是 AGPL 衍生作品 → 待拍板「接受 AGPL / **净室重写（推荐）** / 维持现状」。
 - **部署**：⛔ 资源路径不许硬编码（用 `import.meta.env.BASE_URL`）；⛔ 依赖必须显式进 `package.json`；
   ⭐ 子目录部署是最强探针；⭐ 起服务器与验证**必须同一条命令**；⛔ 验收不许只验「页面能开」。
+
+## O. 弹奏时的性能 / 发声热路径 → `REF-kernel.md §9`（Rust）+ `REF-frontend.md §12`（JS/探针/埋点）
+- **⭐ 瓶颈是「每次都重算本来只依赖源素材的分析」**：`hajimi_tx_run` mode=1 里
+  YIN+`detect_marks` 与 pitch/time 无关，占 mode=1 的 **~78%**（项目自己在
+  `wasm/src/yin_core.rs:6-8` 就写了，但从未跨调用复用）。改后逐样本 bit-exact，
+  实测 **3.6×~70.9×**（改前每次按键恒 ~300ms；改后只有每个素材**首次**付一次分析）。
+- **⛔ 分析缓存的指纹必须覆盖全部样点**：抽哈希会让两段只在尾部不同的素材撞键 →
+  复用**别人的音高轨迹** → 输出错得莫名其妙且不报错。守卫
+  `analysis_cache_tests::cache_distinguishes_sources_differing_only_in_the_tail`。
+- **⛔ `voiced` 必须与分析结果一起缓存**：它填 `LAST_VOICED`，现算的话命中那次报 0 →
+  每次重复按键被判「静默空转」→ 降级 SOLA，症状伪装成「第二次按同一个键音色变了」。
+- **⛔ 缓存额度一律按「字节」不按「条数」**：一条 = `length×channels×4`，跨两个数量级
+  （0.45s 切片 58~173KB / 3 分钟人声 66MB）。固定 8 条对短素材太紧（12 键工作集装不下 →
+  LRU 抖动 → **每次按键都重算**）、对长素材太松（530MB 爆内存）。`evictToBudget` 是三处
+  （wasm 变换 / 自动修音 / 第三方引擎）**共用的纯函数**，且**至少保留一条**。
+- **⛔ 指示灯必须描述实际状态**：`prewarmKeyTransforms` 曾在 WASM 未加载完时直接返回
+  空报告，调用方当「预热完成」→ 灯写「就绪」而**一条变换都没算**；
+  `prewarmReady` 也从不复位。**修**：`await ensureRushLoaded()` + effect 开头
+  `setPrewarmReady(false)`。（「文案照开关写」的又一实例 → §F）
+- **⛔ `warmed` 计数包含缓存命中** → 「warmed === 0」不是判据。判「有没有真算」
+  只能用 **wasm 调用次数**（`hajimi_tx_run` 计数）。
+- **⛔ 按键路径上不许有逐次求值的副作用**：`KeyMachine.destination` 的 getter 每次 trigger
+  都调 `getMasterChain(settings)`（语义 = 传了 settings 就 apply）→ **每按一键重排整条效果链**。
+  用 `peekMasterChain()`。同类：`ensureAudioStarted()` 无条件 `resume()`、
+  `key-machine.ts` 里每次按键的 `console.log`（全仓库唯一一处）。
+- **⭐ 验收靠 `scripts/probe-play-perf.mjs`**（14 项）：每次按下必须起一个 buffer source /
+  按下→start 同步耗时 / 长任务 / **wasm 重算次数**。**⛔ 埋点必须有自检**——
+  给 `instance.exports.hajimi_tx_run` 赋值在严格模式下抛异常被吞掉，计数恒 0 →
+  **13 项假绿**。见 `REF-frontend.md §12`。

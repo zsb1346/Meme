@@ -227,6 +227,8 @@ Moulines & Charpentier 的教科书写法。TD = time-domain，对立面是 FD-P
 | `_probe-degradation-chain.mjs` | **链路级**：复现 `playSample` 模式循环，报最终生效模式 |
 | `_probe-material-level.mjs` | 各档中段电平比 + 质心比（判断是否保共振峰） |
 | `_probe-palette.mjs` | **装配面板交互/样式**（38 条断言；端口上已有 dev server 会复用） |
+| `_probe-psola-cache.mjs` | **改前/改后逐样本 A/B**（同进程两个 wasm 实例；`--a= --b= --sec=`）。**测缓存时音高比不许取 1.0**（恒等短路）→ `REF-kernel.md §9.5` |
+| `probe-play-perf.mjs` | **弹奏实机验收**（14 项）：每次按下必发声 / 按下→start 同步耗时 / 长任务 / **wasm 重算次数**。⛔ 埋点必须自检 → `REF-frontend.md §12.4` |
 | `measure-psola.mjs` / `measure-autotune.mjs` | 合成信号质量体检 |
 | `probe-ai/_probe-wasm-exports.mjs` | wasm 导出清单 + 220Hz 冒烟（改 wasm 后第一时间跑） |
 | `probe-ai/probe-*.html` | AI 弃权率全量扫 / 阈值诊断 / 主线程策略层 / YIN 一致性 |
