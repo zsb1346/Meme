@@ -1294,6 +1294,31 @@ export function sanitizeSynthParamValue(
 }
 
 /**
+ * 两个**单个参数值**是否完全相同。
+ *
+ * 用途只有一处但很关键：`SynthEngine.setPatch` 靠它「值没变就跳过写节点」。
+ *
+ * ⛔ **必须严格相等，不允许容差**。
+ * 那条跳过判断的语义是「节点上已经是这个值了，不必再写」。一旦引入 epsilon，
+ * 一个 1e-6 量级的改动会被判成「没变」而跳过 —— 于是 `this.patch` 记着新值、
+ * 音频节点还是旧值，两边**静默发散**：面板显示与声音不一致，而且不会自愈
+ * （下次 setPatch 又会跳过）。
+ *
+ * 数值一律走 `sanitize` + `quantize` 之后才到这里，所以严格相等不会漏掉
+ * 「本该生效的细微改动」；反而是容差会。
+ *
+ * `addHarm` 是唯一的数组参数（`fitHarm` 每次都新建数组），所以必须逐元素比较。
+ */
+export function synthValueEqual(a: unknown, b: unknown): boolean {
+  if (Array.isArray(a) && Array.isArray(b)) {
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+    return true;
+  }
+  return a === b;
+}
+
+/**
  * 出厂默认 patch 的「有声」下限检查 —— 面板/引擎两侧都靠它兜底。
  *
  * ⚠️ 用**绝对量**而不是相对量：`Σ level > 0` 这种判据在「所有 level 都是 0」

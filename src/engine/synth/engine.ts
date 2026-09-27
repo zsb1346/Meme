@@ -64,6 +64,7 @@ import {
   MAX_UNISON,
   sanitizeSynthParamValue,
   sanitizeSynthPatch,
+  synthValueEqual,
   type GranTex,
   type ModDst,
   type ModSrc,
@@ -2158,6 +2159,15 @@ export class SynthEngine {
   readonly ctx: BaseAudioContext;
   /** ⚠️ 引擎内部状态：Voice 要读它。外部请走 `setPatch` / `applyParam`。 */
   patch: SynthPatch;
+  /**
+   * 「节点上是否已经按某个 patch 全量写完过一轮」的闸门。
+   *
+   * ⛔ 只允许 `setPatch` 在**第一次**调用时把全部键无条件写一遍；
+   * 之后才敢「值没变就跳过」。原因见 `setPatch` 的注释：
+   * 构造期只有 `buildFx` + 一部分显式赋值，若一上来就跳过，
+   * 会留下「节点没被配置过、但 `patch` 里记着值」的静默缺口。
+   */
+  private appliedOnce = false;
   /** 白 / 粉 / 棕三类噪声（8 秒，理由见 `makeNoiseBuffers`） */
   noiseBufs: NoiseBuffers;
   lfoPitch: GainNode;
@@ -2533,14 +2543,67 @@ export class SynthEngine {
   // Patch 写入
   // -------------------------------------------------------------------------
 
-  /** 整体套用（预设 / 存档 hydrate）。全部参数一次写全。 */
+  /**
+   * 整体套用（预设 / 存档 hydrate / 面板尾随落库）。语义是「让引擎等于这份 patch」。
+   *
+   * ══ 为什么必须「值没变就跳过」══
+   *
+   * 原实现对全部 117 个键**无条件**调 `writeParam`。实测（`probe-synth-mobile.mjs`
+   * 的 setPatch 分摊段，CPU 节流 8×）：**一份一个值都没变的 patch 也要 275ms**，
+   * 而只改一个参数同样要 208ms —— 成本只跟「patch 有多少键」有关，跟「改了多少」无关。
+   *
+   * ⭐ **而这 275ms 的大头其实不是那 117 次 `writeParam`，是混响 IR。**
+   * `reverbSize` 也在那个全量循环里，且循环一律传 `bulk = true`，
+   * 于是 `scheduleIR(_, true)` 直接 `rebuildIR` —— **每一份 patch 都重建一次整条
+   * 脉冲响应**，哪怕 `reverbSize` 一个字都没变。实测单次 IR 生成
+   * 6.5ms（1s 尾长）～21ms（4s 尾长），桌面如此，8× 节流下只会更贵。
+   * 也就是说：**面板拖任何一个旋钮，120ms 后的那次尾随落库都会顺手重算一遍混响**。
+   * 去重之后 `reverbSize` 没变就不写、也就不会重建（下面那行
+   * `next.reverbSize !== this.irSeconds` 是兜底），实测 8× 下全等 patch
+   * **275ms → 2.3ms**。
+   *
+   * 后果是真实的：面板拖完旋钮 120ms 后的**尾随落库**、点预设、换引擎、重置
+   * 全走这条路。触屏拖动常常停停走走，防抖被反复触发 → 反复百毫秒级冻结 →
+   * 用户看到的「一卡一卡」。桌面上这条也超过一帧（24.7ms > 16.7ms），
+   * 只是被余量盖住了。
+   *
+   * ══ 跳过为什么是安全的（三条论证，缺一不可）══
+   *
+   *  1. **每个 `writeParam` 分支读的都是 `this.patch`**（已在本函数开头整体换新），
+   *     不是旧值、也不是节点状态。所以「改 A 要连带重推 B」这类联动仍然成立 ——
+   *     只要 A 变了，写 A 的那一次就会用新的 B 重算（例：`drive` 与 `driveType`
+   *     共用 `makeDistCurve`，谁变了都重算，两个都没变才跳过）。
+   *  2. **声部自己从 `eng.patch` 初始化**（`SynthVoice` 构造里 `const p = eng.patch`）。
+   *     所以新建的声部天然拿到当前值，不依赖 `setPatch` 逐个下发。
+   *  3. **第一次调用不跳过**（`appliedOnce`）。构造期只做了 `buildFx` + 部分显式赋值，
+   *     没有任何理由假设「节点已经等于默认 patch」—— 第一次全量写一遍把地基夯实。
+   *
+   *     ⭐ 这条不是空话，`set-patch-dedup.test.ts` 的定向变异证明了它：
+   *     把 `bulk` 写死成 `false`（第一次也允许跳过）之后，「第一次必须全量写」
+   *     那条守卫立刻红，并且**有 2 个预设**的效果链终态真的错了 ——
+   *     因为 `buildFx` 里有些初值是**写死**的（`chorusDry = 1`、`delayWet = 0`…），
+   *     只有第一次全量 `setPatch` 才把它们同步成 patch 的值。
+   *
+   * `reverbSize` 的重建 IR 与本循环的写入是同一件事的两种表述（`writeParam` 里走
+   * `scheduleIR(_, bulk=true)` 会同步重建并更新 `irSeconds`），所以下面那句
+   * `next.reverbSize !== this.irSeconds` 在跳过场景下依然正确。
+   *
+   * ⭐ 等价性由 `src/engine/synth/set-patch-dedup.test.ts` 兜底：
+   * 「从零建一份」与「在旧 patch 上增量改」的节点终态必须一致 ——
+   * 这类守卫这个项目栽过（全量重写曾掩盖顺序依赖），值得单独钉住。
+   */
   setPatch(patch: unknown): void {
     if (this.disposed) return;
     const next = sanitizeSynthPatch(patch);
+    const prev = this.patch;
+    const bulk = !this.appliedOnce;
     this.patch = next;
     for (const key of Object.keys(next) as Array<keyof SynthPatch>) {
+      // 值没变且不是首次 → 节点上已经是这个值，跳过（见上方三条论证）
+      if (!bulk && synthValueEqual(prev[key], next[key])) continue;
       this.writeParam(key, next[key], true);
     }
+    this.appliedOnce = true;
     // 混响空间变化要重建 IR：批量套用不走防抖（否则立刻试听还是旧空间）
     if (next.reverbSize !== this.irSeconds) this.rebuildIR(next.reverbSize);
     // 换整份 patch 时矩阵可能从「没启用」变成「启用」（或反过来），节拍要跟着调整
