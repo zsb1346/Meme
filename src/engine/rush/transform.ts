@@ -28,13 +28,29 @@ export function isRushReady(): boolean {
 
 // 源 buffer → (key → 变换后 buffer)。WeakMap 让源 buffer 卸载后缓存自动回收。
 const cache = new WeakMap<AudioBuffer, Map<string, AudioBuffer>>();
+
 /**
- * 意图：每个源 buffer 最多缓存 8 条变换结果。
- * 旧版无上限 —— 拖 pitch/tau 旋钮每动一下就存一条全长音频，
- * 3 分钟素材一条 66MB，几下就爆内存。
- * Map 插入序即时间序，超出时删最早的条目。
+ * 每个源 buffer 的缓存**字节**预算（不是条数）。
+ *
+ * ⛔ 为什么要从「条数」换成「字节」：一条变换结果 = 长度 × 通道 × 4 字节，
+ * 跨度有两个数量级 —— 0.15~0.45s 的切片是 58~173KB，3 分钟人声是 66MB。
+ * 一个固定条数不可能同时合适：
+ *   · 8 条 → 短素材装不下弹奏的工作集。键位映射下**每个键一个独立音高**，
+ *     12 个键就是 12 条；8 条装不下 → LRU 反复抖动 → **每次按键都重算一次
+ *     整段变换**（实测单次约 300ms，还是同步跑在主线程上）。
+ *   · 把条数调大到够用 → 长素材那边就是 8 × 66MB = 530MB，直接爆内存。
+ *
+ * 按字节给就把两件事同时说清楚：**短素材自然存得多，长素材自然存得少**。
+ * 8MB 额度下：0.45s 素材约 48 条（够几十个键），4s 素材 5 条，3 分钟素材 1 条。
+ *
+ * 旧版是「无上限」，一次爆内存之后补成固定 8 条 —— 那个 8 是为了防爆，不是为了够用。
  */
-const MAX_CACHE_PER_BUFFER = 8;
+export const RUSH_CACHE_BUDGET_BYTES = 8 * 1024 * 1024;
+
+/** 一条变换结果的字节数（f32 × 通道 × 帧）。 */
+export function transformBytes(b: AudioBuffer): number {
+  return b.length * b.numberOfChannels * 4;
+}
 
 /**
  * 「这段源素材上 PSOLA 等于没做事」——记下来就不必每次重算再失败。
@@ -178,10 +194,38 @@ export function transformBuffer(
   }
 
   m.set(key, out);
-  // 缓存上限：超出时删最早的条目（Map 插入序即时间序）
-  if (m.size > MAX_CACHE_PER_BUFFER) {
-    const firstKey = m.keys().next().value;
-    if (firstKey !== undefined) m.delete(firstKey);
-  }
+  evictToBudget(m, RUSH_CACHE_BUDGET_BYTES, transformBytes);
   return out;
+}
+
+/**
+ * 按字节预算淘汰最久未用的条目。Map 插入序即时间序，所以从头部开始删。
+ *
+ * 抽成导出的纯函数，而不是内联在 `transformBuffer` 里，只有一个理由：
+ * **内联的那一版在单测里够不着**。`transformBuffer` 要真 `AudioBuffer`
+ * （vitest 跑在 node 环境，没有 Web Audio），缓存淘汰这种行为就变成了盲区 ——
+ * 而它恰恰是「按键卡不卡」的直接决定因素。
+ *
+ * 三条不变式：
+ *   · 总额不超预算（除非只剩一条，见下）；
+ *   · **至少保留一条** —— 一条都不留就等于每次都重算，那比超预算更糟，
+ *     而且刚插入的那条在末尾，从头部删不会伤到它；
+ *   · 不超预算时一条都不动（别做无谓的删除）。
+ *
+ * 三处缓存共用本函数（变调 / 修音 / 第三方引擎），所以口径只有这一份。
+ */
+export function evictToBudget<K>(
+  m: Map<K, AudioBuffer>,
+  budgetBytes: number,
+  bytesOf: (b: AudioBuffer) => number,
+): void {
+  let total = 0;
+  for (const v of m.values()) total += bytesOf(v);
+  while (total > budgetBytes && m.size > 1) {
+    const firstKey = m.keys().next().value;
+    if (firstKey === undefined) break;
+    const victim = m.get(firstKey);
+    if (victim !== undefined) total -= bytesOf(victim);
+    m.delete(firstKey);
+  }
 }

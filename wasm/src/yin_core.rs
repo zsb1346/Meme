@@ -52,44 +52,79 @@ pub fn yin_frame(
         let diff = &mut diff[..=max_tau];
         let cmnd = &mut cmnd[..=max_tau];
 
-        // ---- 差分函数 d(tau) = Σ_j (x[j] - x[j+tau])² ----
+        // ---- 差分函数 + CMND + 阈值搜索：**交错**做，命中即止 ----
         //
         // 用不可变切片 + zip：两个子切片各自只做一次边界检查，内层循环因此
         // 完全没有下标检查（原先 `x[j]` / `x[j + tau]` 双索引每次迭代都要判两次）。
+        //
+        // ⛔ 为什么可以「算到命中就停」，而且**不改变任何一个数值**：
+        // CMND 的归一化分母是 `running = Σ_{k=1..tau} d[k]` —— 它**只累积到当前 tau**，
+        // 所以 `cmnd[tau]` 的值只取决于 `d[1..=tau]`，后面那些 tau 的 d 值再大再小
+        // 都进不了这个商。而阈值搜索本来就是「找**第一个**能过阈的 tau」，
+        // 于是命中之后剩下的 d 全是白算。
+        //
+        // 这不是近似：`running` 的累加顺序（1,2,3,…）与原来完全一致，
+        // 每一项的求和顺序也一致 → 提前停止时算出来的**每一个 cmnd 逐位相同**。
+        //
+        // 收益取决于 f0：人声 200Hz 时 tau_est = sr/200 = 240，而 max_tau = 960
+        // → 只算 1/4；低到 100Hz 也有 2 倍。整个差分函数是链路里唯一的大头
+        // （见本文件头部），所以这是最划算的一处。
+        //
+        // ⚠️ 没有过阈（清音 / 噪声 / 打击乐）时仍会一路算到 max_tau ——
+        // 那种帧本来就取不到音高，退化成原成本，不会更慢。
         let a = &x[offset..offset + win];
-        for tau in 1..=max_tau {
-            let b = &x[offset + tau..offset + tau + win];
-            let mut sum = 0.0f32;
-            for (p, q) in a.iter().zip(b.iter()) {
-                let delta = p - q;
-                sum += delta * delta;
-            }
-            diff[tau] = sum;
-        }
-
-        // ---- CMND ----
         cmnd[0] = 1.0;
         let mut running = 0.0f32;
-        for tau in 1..=max_tau {
-            running += diff[tau];
-            cmnd[tau] = if running == 0.0 {
-                1.0
-            } else {
-                (diff[tau] * tau as f32) / running
-            };
+        // `done` = 已经算到第几个 tau。初始值 0 在任何路径下都会被第一次
+        // `step_tau!` 覆盖，所以编译器会就「赋值后从未读取」告警 —— 但它是
+        // 「一条都还没算」这个状态本身需要的起点，不能省。
+        #[allow(unused_assignments)]
+        let mut done = 0usize;
+        let mut tau_est: Option<usize> = None;
+
+        // 把「算一格 tau」写成宏：下坡搜索需要按需补算后续格子，
+        // 用闭包会同时可变借用 diff/cmnd 与 running，借用检查过不去。
+        macro_rules! step_tau {
+            ($tau:expr) => {{
+                let tau: usize = $tau;
+                let b = &x[offset + tau..offset + tau + win];
+                let mut sum = 0.0f32;
+                for (p, q) in a.iter().zip(b.iter()) {
+                    let delta = p - q;
+                    sum += delta * delta;
+                }
+                diff[tau] = sum;
+                running += sum;
+                cmnd[tau] = if running == 0.0 {
+                    1.0
+                } else {
+                    (sum * tau as f32) / running
+                };
+                done = tau;
+            }};
         }
 
-        // ---- 阈值搜索 ----
-        let mut tau_est: Option<usize> = None;
-        for tau in min_tau..=max_tau {
-            if cmnd[tau] < threshold {
+        let mut tau = 1usize;
+        while tau <= max_tau {
+            step_tau!(tau);
+            if tau >= min_tau && cmnd[tau] < threshold {
+                // 找到了第一个过阈点。跟着下坡走到谷底 —— 这一步需要
+                // `cmnd[t + 1]`，所以按需把后续格子补齐（通常只需补 1~3 格）。
                 let mut t = tau;
-                while t + 1 <= max_tau && cmnd[t + 1] < cmnd[t] {
-                    t += 1;
+                while t + 1 <= max_tau {
+                    if done < t + 1 {
+                        step_tau!(t + 1);
+                    }
+                    if cmnd[t + 1] < cmnd[t] {
+                        t += 1;
+                    } else {
+                        break;
+                    }
                 }
                 tau_est = Some(t);
                 break;
             }
+            tau += 1;
         }
         let tau_est = tau_est?;
 

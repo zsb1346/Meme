@@ -117,12 +117,6 @@ export class KeyMachine {
     const cursorBefore = this.cursors[keyIndex] ?? 0;
     const slotIndex = cursorBefore % key.sequence.length;
     const ref = key.sequence[slotIndex];
-    console.log('[trigger]', {
-      keyIndex,
-      cursorBefore,
-      slotIndex,
-      ref,
-    });
     if (!ref) return { ...idle, slotIndex };
 
     // 游标无条件推进（即使缓冲缺失也推进，保持序列位置语义稳定）

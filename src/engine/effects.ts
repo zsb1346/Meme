@@ -203,3 +203,24 @@ export function disposeMasterChain(): void {
   master?.dispose();
   master = null;
 }
+
+/**
+ * 取实时主链的**节点**，不重新 apply 参数；链尚未建立时返回 null。
+ *
+ * ⛔ 为什么需要它：`getMasterChain(settings)` 的语义是「传了 settings 就 apply」，
+ * 而 `KeyMachine` 的 `destination` 是个**每次 trigger 都求值的 getter** ——
+ * 用它等于**每按一个键就把整条效果链的参数重排一遍**（还顺手排一条新的
+ * 50ms 输出增益斜坡）。
+ *
+ * 那些参数本来就是这条链自己的当前状态：`App` / `MixPage` 已经在 store 订阅里
+ * 调 `getMasterChain(settings)` 同步过了。在按键路径上再 apply 一份完全相同的
+ * 东西是纯浪费；更要紧的是它会**掩盖这笔成本** —— 将来任何一级的 apply 变重
+ * （比如某个单元开始做同步运算），都会直接加到每一次按键的延迟上，
+ * 而现场完全看不出来源。
+ *
+ * 首次建链仍然需要 settings，那条路由调用方（App 启动 / store 订阅）负责；
+ * 这里只提供一个「只读、无副作用」的取用口。
+ */
+export function peekMasterChain(): EffectChain | null {
+  return master;
+}

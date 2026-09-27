@@ -696,6 +696,234 @@ pub fn detect_marks(x: &[f32], frames: &[PitchFrame], sr: f32) -> Vec<Mark> {
 }
 
 // ---------------------------------------------------------------------------
+// 模块 B2：分析结果复用（frames + marks）
+// ---------------------------------------------------------------------------
+
+use std::cell::RefCell;
+use std::rc::Rc;
+
+/// 一次「源素材分析」的全部产物。
+///
+/// 为什么要单独成一个结构：`track_pitch` + `detect_marks` 合起来占
+/// `hajimi_tx_run` mode=1 的绝大部分耗时（`yin_core.rs` 头部实测 ~78%），
+/// 而它们**只依赖源素材的通道 0**，与 `pitch` / `time` 无关。
+/// 可调用方 `apply_planar_inner` 是按 (pitch, time) 被调用的 ——
+/// 同一素材弹 12 个不同音高，就是同一份分析被算 12 遍。
+pub struct Analysis {
+    frames: Rc<Vec<PitchFrame>>,
+    marks: Rc<Vec<Mark>>,
+    /// 与 `frames` 同源的 voiced 帧数。
+    ///
+    /// 必须一起缓存：`LAST_VOICED` 是用它填的（判定「静默空转」），
+    /// 而 frames 既然复用了，计数就不能现算 —— 否则缓存命中那一次
+    /// 会把 voiced 数报成 0，于是**每一次重复按键都被判成静默失效**，
+    /// 降级到 SOLA。症状会伪装成「第二次按同一个键音色变了」。
+    voiced: usize,
+}
+
+/// 缓存容量。
+///
+/// 一个素材的分析结果只有 `frames`（每 10ms 一条 × 12 字节）与 `marks`
+/// （每周期一条 × 4 字节）—— 1 秒素材约 1.5KB，**比变换后的音频小两个数量级**
+/// （那个是几十到几百 KB，所以它那边只能存 8 条）。这里因此可以放心按
+/// 「键位工作集」给：12 键绑 3 个素材、21 键绑若干素材，48 条都装得下。
+/// ⛔ 定成 1 会退化成「每换一个素材就把上一个扔掉」—— 那正是本模块要消灭的行为。
+const ANALYSIS_CACHE_CAP: usize = 48;
+
+thread_local! {
+    /// (源指纹 → 分析结果)，LRU：末端最新，头部最先淘汰。
+    /// wasm 单线程，thread_local 等价于全局。按**素材条数**而不是按 (素材,音高) 计。
+    static ANALYSIS: RefCell<Vec<(u64, Analysis)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// 源素材的 64 位指纹：长度 + 采样率 + 逐样点 FNV-1a。
+///
+/// ⛔ **必须覆盖全部样点，不许抽样**：抽样会在「两段不同素材恰好被抽到的点相同」
+/// 时给出同一个指纹，于是下一次调用复用的是**另一段素材的音高轨迹** ——
+/// 输出会错得莫名其妙、而且不抛异常、不报错，是本项目最忌讳的那类失败。
+/// 全量哈希是 O(n)：0.45s 素材约 2 万次乘法（~0.02ms），相对它换掉的那次
+/// O(n·max_tau) 分析（约 300ms）完全不值一提。
+///
+/// 为什么按位（`to_bits`）而不是按数值比：-0.0 与 +0.0 在 `==` 下相等但可能
+/// 产生不同结果，NaN 更是无法用相等判断。按位比是唯一稳妥的比法 ——
+/// 同一份 buffer 每次传进来的位模式必然相同。
+fn fingerprint(x: &[f32], sr: f32) -> u64 {
+    const P: u64 = 0x0000_0100_0000_01b3;
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    h ^= x.len() as u64;
+    h = h.wrapping_mul(P);
+    h ^= sr.to_bits() as u64;
+    h = h.wrapping_mul(P);
+    for &v in x {
+        h ^= v.to_bits() as u64;
+        h = h.wrapping_mul(P);
+    }
+    h
+}
+
+/// 取（必要时计算）源素材的分析结果。
+///
+/// 返回 `Rc` 的克隆而不是借用：调用方持有期间缓存条目可以被换出，
+/// 数据本身不会失效（引用计数兜着）。命中路径只比较指纹、不做任何 DSP。
+fn analysis_for(x: &[f32], sr: f32) -> (Rc<Vec<PitchFrame>>, Rc<Vec<Mark>>, usize) {
+    let fp = fingerprint(x, sr);
+
+    let hit = ANALYSIS.with(|c| {
+        let mut list = c.borrow_mut();
+        let idx = match list.iter().position(|(k, _)| *k == fp) {
+            Some(i) => i,
+            None => return None,
+        };
+        let (_, a) = list.remove(idx);
+        let out = (Rc::clone(&a.frames), Rc::clone(&a.marks), a.voiced);
+        list.push((fp, a));
+        Some(out)
+    });
+    if let Some(out) = hit {
+        return out;
+    }
+
+    // 未命中：算一次，此后该素材的**全部** (pitch, time) 组合都从这里取。
+    let frames = track_pitch(x, sr);
+    let marks = detect_marks(x, &frames, sr);
+    let voiced = frames.iter().filter(|f| f.voiced).count();
+    let a = Analysis {
+        frames: Rc::new(frames),
+        marks: Rc::new(marks),
+        voiced,
+    };
+    let out = (Rc::clone(&a.frames), Rc::clone(&a.marks), a.voiced);
+    ANALYSIS.with(|c| {
+        let mut list = c.borrow_mut();
+        list.push((fp, a));
+        if list.len() > ANALYSIS_CACHE_CAP {
+            list.remove(0);
+        }
+    });
+    out
+}
+
+/// 仅供测试：清空分析缓存。
+///
+/// 存在的唯一理由是让测试能构造「同一段素材、缓存冷热两种状态」——
+/// 「复用分析结果」这件事的正确性判据就是**两种状态下输出逐位相同**，
+/// 没有一个能清缓存的口子，这个对拍写不出来。
+#[cfg(test)]
+pub(crate) fn reset_analysis_cache() {
+    ANALYSIS.with(|c| c.borrow_mut().clear());
+}
+
+/// 仅供测试：当前缓存里的条目数。
+///
+/// 用来断言「换音高不新增条目」—— 只比输出的话，把缓存删掉照样全绿，
+/// 性能会悄悄退化回「每次按键重跑 YIN」而没有任何测试会红。
+#[cfg(test)]
+pub(crate) fn analysis_cache_len() -> usize {
+    ANALYSIS.with(|c| c.borrow().len())
+}
+
+/// 分析结果复用的守卫。
+///
+/// 这两条守的不是「输出对不对」（那由 `tests` 里那一批负责），而是
+/// **缓存不会让输出变错、也不会偷偷失效**：
+///   · 指纹太弱 → 复用了别的素材的轨迹 → 输出错得莫名其妙；
+///   · 缓存键含了 pitch → 每次都重算 → 输出照样对，性能悄悄退化。
+/// 两者都**没有可见症状**，只能靠测试钉住。
+#[cfg(test)]
+mod analysis_cache_tests {
+    use super::*;
+
+    const SR: f32 = 48000.0;
+
+    /// 谐波堆 —— 周期性内容，确保走的是颗粒重排路径而不是固定颗粒直通。
+    fn tones(f0: f32, sr: f32, n: usize) -> Vec<f32> {
+        let mut x = vec![0.0f32; n];
+        let mut k = 1usize;
+        while (k as f32) * f0 < sr * 0.45 {
+            let a = 1.0 / (k as f32 * k as f32);
+            for (i, v) in x.iter_mut().enumerate() {
+                *v += a * (2.0 * std::f32::consts::PI * k as f32 * f0 * i as f32 / sr).sin();
+            }
+            k += 1;
+        }
+        x
+    }
+
+    /// ⭐ 指纹必须覆盖全部样点，只看前缀是不行的。
+    ///
+    /// 构造「两段前 60% 完全相同、只在尾部不同」的素材。如果哪天有人为了
+    /// 让指纹算得快而改成「只哈希前 N 个点」或「每隔 K 个取一个」，
+    /// 第二条 b 会命中 a 的条目 → 它被**用别人的颗粒位置**合成，
+    /// 输出不再等于「单独算 b」的结果 —— 本用例会红。
+    #[test]
+    fn cache_distinguishes_sources_differing_only_in_the_tail() {
+        let n = 12000;
+        let a = tones(180.0, SR, n);
+        let mut b = a.clone();
+        let tail = tones(260.0, SR, n);
+        for i in (n * 3 / 5)..n {
+            b[i] = tail[i];
+        }
+
+        reset_analysis_cache();
+        let a_alone = apply_planar(&[&a], SR, 1.3, 1.0);
+        reset_analysis_cache();
+        let b_alone = apply_planar(&[&b], SR, 1.3, 1.0);
+        assert_ne!(a_alone, b_alone, "两段不同的素材本来就该有不同的输出");
+
+        // 交替请求：a 先占住缓存，再要 b，再回到 a
+        reset_analysis_cache();
+        let a_first = apply_planar(&[&a], SR, 1.3, 1.0);
+        let b_after_a = apply_planar(&[&b], SR, 1.3, 1.0);
+        let a_again = apply_planar(&[&a], SR, 1.3, 1.0);
+
+        assert_eq!(a_alone, a_first, "a 的输出不该受缓存状态影响");
+        assert_eq!(b_alone, b_after_a, "b 命中了 a 的分析结果（指纹太弱）");
+        assert_eq!(a_alone, a_again, "a 回头时不该命中 b 的分析结果");
+    }
+
+    /// ⭐ 同一素材的不同音高只该付一次分析。
+    ///
+    /// 断言分两层：输出（缓存不许改变结果）+ 条目数（缓存必须真的命中）。
+    /// 只有前者的话，把缓存整个删掉照样全绿 —— 而那正是要防的退化。
+    #[test]
+    fn same_source_different_pitches_share_one_analysis() {
+        let x = tones(200.0, SR, 12000);
+
+        reset_analysis_cache();
+        let base = apply_planar(&[&x], SR, 1.25, 1.0);
+        assert_eq!(analysis_cache_len(), 1, "首次调用应建立 1 条分析条目");
+
+        for p in [0.7f32, 0.85, 1.2, 1.5, 2.0] {
+            let _ = apply_planar(&[&x], SR, p, 1.0);
+        }
+        assert_eq!(
+            analysis_cache_len(),
+            1,
+            "分析只依赖源素材：换音高不许新增条目，否则等于每次按键重跑 YIN"
+        );
+
+        let again = apply_planar(&[&x], SR, 1.25, 1.0);
+        assert_eq!(base, again, "绕了一圈回来，输出必须与第一次逐位相同");
+    }
+
+    /// 退化输入不该把缓存搅坏（空输入 / 全零 / 极短）。
+    #[test]
+    fn degenerate_inputs_do_not_poison_the_cache() {
+        reset_analysis_cache();
+        let x = tones(220.0, SR, 12000);
+        let good = apply_planar(&[&x], SR, 1.4, 1.0);
+
+        let _ = apply_planar(&[&[]], SR, 1.4, 1.0);
+        let _ = apply_planar(&[&vec![0.0f32; 512]], SR, 1.4, 1.0);
+        let _ = apply_planar(&[&vec![0.0f32; 8]], SR, 1.4, 1.0);
+
+        let again = apply_planar(&[&x], SR, 1.4, 1.0);
+        assert_eq!(good, again, "退化输入之后，正常素材的结果必须不变");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 模块 C：合成内核（PitchNet render）
 // ---------------------------------------------------------------------------
 
@@ -1536,14 +1764,26 @@ fn apply_planar_inner(
     let timef = time as f64;
     let out_len = ((total as f64) * timef).round().max(1.0) as usize;
 
-    // 通道 0 做逐帧 F0 轨迹；marks 覆盖全曲 voiced run
-    let frames = track_pitch(planar[0], sr);
-    let marks = detect_marks(planar[0], &frames, sr);
+    /*
+      通道 0 做逐帧 F0 轨迹；marks 覆盖全曲 voiced run。
+
+      ⛔ 这两件事**只依赖源素材的通道 0**，与 pitch / time 无关 —— 而本函数正是
+      按 (pitch, time) 被调用的。同一素材弹 12 个不同音高 = 同一份分析算 12 遍，
+      而分析占本函数总耗时的绝大部分（见 `yin_core.rs` 头部的实测）。
+      所以走缓存：冷的一次付全价，此后该素材的每个音高都只剩合成成本。
+
+      缓存键是源素材的**内容指纹**而不是对象身份 —— 调用方（`stretch.rs`）每次都
+      把样点从 JS 侧重新拷进来，没有稳定的指针可用。详见 [`fingerprint`]。
+    */
+    let (frames_rc, marks_rc, voiced_frames) = analysis_for(planar[0], sr);
+    let frames: &Vec<PitchFrame> = &frames_rc;
+    let marks: &Vec<Mark> = &marks_rc;
     // 记录「这段素材到底有没有周期可同步」——调用方据此判断本次变调是不是静默空转。
+    // 计数必须取自缓存：见 `Analysis::voiced` 的注释（现算会把重复按键误判成失效）。
     LAST_VOICED.with(|c| {
-        c.set((frames.iter().filter(|f| f.voiced).count(), marks.len()));
+        c.set((voiced_frames, marks.len()));
     });
-    let mask = build_blend_mask(&frames, timef, out_len);
+    let mask = build_blend_mask(frames, timef, out_len);
     // 变调路径：ratio 是常量 —— 同一个内核，只是曲线退化成一条水平线。
     let ratio = |_: f64| pitch as f64;
     // 启用线以上完全不动：升调 / unity / 轻微降调与 mode 1 逐样本相同。
@@ -1557,7 +1797,7 @@ fn apply_planar_inner(
             // 拆分只影响「喂给颗粒内核的是什么、残余怎么加回来」，
             // 后续的 Σw 归一 / 增益匹配 / blend 全部原样复用。
             let folded = if split {
-                Some(split_harmonic(src, &frames, sr))
+                Some(split_harmonic(src, frames, sr))
             } else {
                 None
             };
@@ -1571,7 +1811,7 @@ fn apply_planar_inner(
             };
 
             let (mut synth, _env) =
-                synth_channel(reference, &marks, &frames, sr, &ratio, timef, out_len);
+                synth_channel(reference, marks, frames, sr, &ratio, timef, out_len);
 
             // 局部增益匹配：源侧位置按时间映射回查。
             // 拆分开启时参照物必须是**谐波成分**（残余还没加回来），否则会把

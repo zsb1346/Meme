@@ -27,9 +27,19 @@ export const PREVIEW_LEAD_SEC = 0.08;
 /** 取上下文并尝试 resume（已解锁时为 no-op）。返回值可直接用于解码/调度。 */
 export function ensureAudioStarted(): AudioContext {
   const c = getAudioContext();
-  void c.resume().catch((err) =>
-    console.warn('[core] AudioContext resume 失败（等待用户手势）', err),
-  );
+  /*
+    只在真的没跑起来时才 resume。
+
+    这里是**每次按键**都会走的热路径（handlePress 第一句）。旧写法无条件
+    调 `resume()`，已解锁时每次仍要造一个 promise、挂一个 `.catch`、再排一个
+    微任务 —— 单次微不足道，但连按十几个键时它和真正的声音调度抢同一帧。
+    行为完全一致：`running` 时 resume 本来就是 no-op（这句注释原本就这么写）。
+  */
+  if (c.state !== 'running') {
+    void c.resume().catch((err) =>
+      console.warn('[core] AudioContext resume 失败（等待用户手势）', err),
+    );
+  }
   return c;
 }
 

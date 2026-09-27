@@ -14,6 +14,7 @@ import { getKeyMachine, syncKeyMachine } from '../engine/key-machine-singleton';
 import {
   collectReferencedSampleIds,
   prewarmBuffers,
+  prewarmKeyTransforms,
 } from '../model/buffer-cache-service';
 import { ensureAudioStarted } from '../engine/core';
 import { type MemeKeyPressResult } from '../components/keys/MemeKey';
@@ -101,13 +102,32 @@ export function useKeyMachineController(activeKeys?: Key[]): KeyMachineControlle
   useEffect(() => {
     if (!hydrated) return;
     let cancelled = false;
-    // README §3：序列引用集预热收编至 model/buffer-cache-service（含并发合并；
-    // 缺 Blob/解码失败的 id 计入 missing，流程照常完成 → ready 照常置位）
-    void prewarmBuffers(
-      collectReferencedSampleIds(useStore.getState().project),
-    ).then(() => {
-      if (!cancelled) setPrewarmReady(true);
-    });
+    /*
+      ⛔ 每一轮预热开始都必须先把指示灯压回「预热」。
+
+      这个 effect 的依赖是 [hydrated, blobs] —— 也就是**每次新增/删除素材都会重跑**。
+      旧写法只在末尾 `setPrewarmReady(true)`，从不复位，于是：首轮预热完成后灯就
+      永远亮着；用户之后导入一批新素材、新一轮预热正在同步阻塞主线程时，指示灯
+      仍然写着「就绪」。用户照着「就绪」按下去，撞上的正是那一轮预热 —— 这是
+      指示灯在说假话（用户实报的「有些时候按下去没声/很卡」里就有这一幕）。
+    */
+    setPrewarmReady(false);
+    void prewarmBuffers(collectReferencedSampleIds(useStore.getState().project))
+      /*
+        解码之后紧接着预热**变换结果** —— 见 `prewarmKeyTransforms` 的注释。
+
+        为什么这两件事要连在一起、共用同一个 prewarmReady 指示灯：
+        解码只把 mp3 变成 AudioBuffer，真正贵的是整段变调（同步跑在主线程）。
+        键位映射下每个键一个独立音高，所以「按下一个没按过的键」= 主线程冻结一次
+        整段变换；不预热就等于把关卡设在**用户按下去的那一刻**。
+        两者都在「用户开始弹之前」完成，指示灯才有意义（「就绪」= 真的可以弹了）。
+      */
+      .then(() =>
+        prewarmKeyTransforms(keysRef.current, { isCancelled: () => cancelled }),
+      )
+      .then(() => {
+        if (!cancelled) setPrewarmReady(true);
+      });
     return () => {
       cancelled = true;
     };

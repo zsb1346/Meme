@@ -14,6 +14,7 @@
  *  - amount <= 0 → 直通返回源（不拷贝）。
  */
 import { loadHajimiWasm, type HajimiWasm } from './loader';
+import { evictToBudget, RUSH_CACHE_BUDGET_BYTES, transformBytes } from './transform';
 
 let wasm: HajimiWasm | null = null;
 let loading: Promise<HajimiWasm> | null = null;
@@ -50,11 +51,17 @@ export interface AutotuneParams {
 // 源 buffer → (参数 key → 修音后 buffer)。WeakMap 让源 buffer 卸载后缓存自动回收。
 const cache = new WeakMap<AudioBuffer, Map<string, AudioBuffer>>();
 /**
- * 意图：每个源 buffer 最多缓存 8 条修音结果（与 transform.ts 同额度）。
- * 修音结果同样是全长音频，参数滑杆连拖会瞬间堆出几十条，必须限流。
- * Map 插入序即时间序，超出时删最早的条目；命中后移到末尾（LRU）。
+ * 每个源 buffer 的缓存**字节**预算。
+ *
+ * 与 `transform.ts` 共用同一个额度常量，而不是各写一个条数：
+ * 修音结果与变换结果是同一种东西（全长音频），大小也跨两个数量级
+ * （0.15s 切片 58KB ~ 3 分钟人声 66MB）。按条数限流对短素材太紧、对长素材太松；
+ * 按字节就把「短素材存得多、长素材存得少」这件事一并说清楚了。
+ *
+ * 这里唯一与变换路径不同的是**缓存键**：修音的 key 是参数组（`keyOf`），
+ * 拖动滑杆会连续产生新 key —— 那正是「额度」要防的东西。
  */
-const MAX_CACHE_PER_BUFFER = 8;
+const MAX_CACHE_BYTES_PER_BUFFER = RUSH_CACHE_BUDGET_BYTES;
 
 function keyOf(p: AutotuneParams): string {
   return [
@@ -135,10 +142,6 @@ export function autotuneBuffer(
   }
 
   m.set(key, out);
-  // 缓存上限：超出时删最早的条目（Map 插入序即时间序）
-  if (m.size > MAX_CACHE_PER_BUFFER) {
-    const firstKey = m.keys().next().value;
-    if (firstKey !== undefined) m.delete(firstKey);
-  }
+  evictToBudget(m, MAX_CACHE_BYTES_PER_BUFFER, transformBytes);
   return out;
 }

@@ -1,7 +1,14 @@
 import * as Tone from 'tone';
 import { getAudioContext } from './core';
 import { playbackRateForSemitones } from './pitch';
-import { isRushReady, PsolaSilentNoopError, transformBuffer } from './rush/transform';
+import {
+  evictToBudget,
+  isRushReady,
+  PsolaSilentNoopError,
+  RUSH_CACHE_BUDGET_BYTES,
+  transformBuffer,
+  transformBytes,
+} from './rush/transform';
 import {
   getActiveEngineId,
   getActiveShift,
@@ -333,8 +340,8 @@ const EXT_MAX_FREQ = 900;
  */
 const extCache = new WeakMap<AudioBuffer, Map<string, AudioBuffer>>();
 
-/** 每段源素材最多缓存 8 条（与 `rush/transform` 同一约定：拖旋钮不该把内存拖爆） */
-const MAX_EXT_CACHE_PER_BUFFER = 8;
+/** 每段源素材的缓存**字节**额度（与 `rush/transform` 同一口径，见那边的说明）。 */
+const MAX_EXT_CACHE_BYTES_PER_BUFFER = RUSH_CACHE_BUDGET_BYTES;
 
 /**
  * 用第三方引擎做整段变换（实验分支 feat/lib-engines）。
@@ -464,10 +471,7 @@ function transformByExternalCached(
 
   const out = transformByExternal(ctx, input, pitch, time, engineId, shift, stretch);
   m.set(key, out);
-  if (m.size > MAX_EXT_CACHE_PER_BUFFER) {
-    const firstKey = m.keys().next().value;
-    if (firstKey !== undefined) m.delete(firstKey);
-  }
+  evictToBudget(m, MAX_EXT_CACHE_BYTES_PER_BUFFER, transformBytes);
   return out;
 }
 
