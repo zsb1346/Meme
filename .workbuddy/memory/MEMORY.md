@@ -103,6 +103,11 @@
 - **⭐ 改音色表 / 改引擎后必须重跑两个探针**（先起 dev server、跑前 `unset HTTP_PROXY`）：`probe-synth.mjs`
   （**按下去**有没有声）+ `probe-synth-lifecycle.mjs`（**松开后**有没有停）—— **vitest 没有 Web Audio** →
   用 `OfflineAudioContext` 真渲染量 rms 绝对量。**⭐ 写完守卫必须回退修复、证明它会红**（曾红 15 项）。
+- **⭐ 怀疑「卡 / 慢」→ 跑第三个探针 `probe-synth-mobile.mjs 5199`**（CDP + 手机视口 + CPU 节流 1/4/6/8x）。
+  **离线探针量不到卡顿**（不跑定时器、没有主线程占用）→ 必须靠 CPU 节流复现。
+  **三个已排除的嫌疑（别再查）**：声部泄漏（账目全绿）、250ms 清扫器（4ms）、16ms 调制节拍（没跑）。
+  **最大开销是 `setPatch` 全量重写 117 键、无早退** → 面板 120ms 尾随落库在手机上冻结 167ms。
+  详情与实测表 → `REF-synth.md §7`。
 - **⛔ 起振清单一份只能背一种语义**：`triggerStarts`（`trigger` 负责 start）与 `extraStarts`
   （**只登记回收**，源自己在别处 start）必须分开 —— 共用一份时弦鸣的 `burst` 被 start 两次
   → 真机 `InvalidStateError`，**整条声部静默**（2026-09-27）。
@@ -112,6 +117,9 @@
   经典引擎，六个新引擎只有探针铺开才覆盖得到。
 
 ## J. 卷帘：电脑键盘弹奏 + 左侧钢琴栏 → `REF-frontend.md §9`（契约与画法全在那儿）
+**性能三层测量 + A/B 像素协议 → `REF-frontend.md §10`。** 一句话：`ops/帧` 是**结构指标**
+（与机器无关 → 优化前后对拍用它）；帧间隔只用来「排除」；⛔ 探针插桩会污染 CPU 采样；
+⛔ 合批能砍 45% 但**会动重叠块的 z-order → 待用户拍板**。
 - **⛔ 卷帘只发合成声**（用户定稿）。映射在 `roll/keyboard-play.ts`；**结构守卫 `roll/roll-synth-only
   .test.ts`** 禁止 import 采样/导出链路 —— **这条约束没有运行时症状**（破坏后只是「音色变厚了」，会被当成
   调得好而收下），必须做成测试期红。
@@ -132,6 +140,22 @@
   ② **永远为假的守卫 = 谎言**（`typeof store.setSelectedTakeId === 'function'` 恒假且该动作不存在 →
   静默跳过 → 探针在**别人的 take** 上白测）。**take 的选中是页面私有 `useState`，从 store 够不着；
   注入 `takes[0]` 才是唯一手段。**
+
+## N. 按键动画：多键同按 + 长按 → `REF-frontend.md §11`（契约与红线全在那儿）
+- **内核 = `hooks/key-anim-state.ts`（纯函数、node 可测）**，React 壳只有 `useKeyAnimations`。
+  **按下 = 集合、闪灯 = 映射**；⛔ **「按下」不许有任何定时器**（持续态只能由松开事件结束）
+  —— 旧版单槽 + 260ms 自动松手 = 「多键同按只亮一个 + 不能长按」。
+- ⛔ **`showPressed = pressed || externalHeld`（取或）**；三处渲染决策（边框/`transform`/transition）
+  **必须全部读它**。只写定义、决策点读裸 `pressed` 的后果是**「键盘路径不亮、指针路径正常」**，
+  且 `toContain('那行定义')` 抓不住（→ `REF-env.md §8.2`）。
+- ⛔ **keydown 与 keyup 语义相反**（`shortcuts.ts`）：keyup **不短路** / `guardInput` 默认 **false**
+  / **不设 `when`** / `keys` 省略 = 收全部。**拦掉、漏掉「松开」= 键位永久卡在按下态。**
+- ⛔ **动画归各输入路径自己**（谁发起谁负责）：指针归 MemeKey 本地态（多指同按免费成立），
+  键盘归页面 `registerKeyUp`。⛔ 让「按下态」经过声音层的判断 =
+  按了绑定键**毫无视觉反馈**（`playNote` 只在不可演奏时返回 `null`）。
+- ⭐ 验收靠 **`scripts/probe-keys-anim.mjs`**（S1 鼠标长按 / S2 触摸双指 / S3 键盘同按）——
+  **手指/键盘同时按的连接处单测覆盖不到**。
+- ⛔ **同一文件的多处编辑必须串行**（并行 Edit 会静默互相覆盖，见 `REF-env.md §8.1`）。
 
 ## K–M. 手机端 / 许可 / 部署 → `REF-ship.md`
 - **手机端**：设计已定稿待落地（`原型/手机端设计.md`）。**四条理念**（修饰键→可见模式、切层不挤压、

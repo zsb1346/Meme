@@ -28,10 +28,14 @@
 
 ## 4. 网络
 
-- **⛔ 本机挂着环境代理**（系统代理 `127.0.0.1:10809` 已开，`ProxyOverride` 含
-  `localhost;127.*`；另有 `HTTP_PROXY` 环境变量，可能已死）→ 访问 loopback 必须绕开：
+- **⛔ 本机挂着环境代理**（系统代理 `127.0.0.1:10809`，`ProxyOverride` 含
+  `localhost;127.*`）→ 访问 loopback 必须绕开：
   Chrome 用 `--no-proxy-server`，curl 用 `--noproxy '*'`，
   跑 CDP 探针前 `unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy`。
+  ⚠️ **但这个代理是「用户手动开的代理软件」，不是常驻服务，随时可能没开** ——
+  没开时 `10809`/`11123` 都是**连接被拒绝**（无监听），不是超时。
+  探活：`curl -x http://127.0.0.1:10809 https://github.com`（200 = 通了）。
+  踩坑与推送排错顺序 → 技能 `git-remote-publish §2`。
 - **⛔ 本机对「无人监听的端口」不回 RST —— SYN 被丢掉，连接要干等约 2 秒才失败。**
   实测死端口：IPv4 2.44~2.64s / IPv6 2.35~2.44s。
   **推论：dev server 只绑一族 = 另一族每次都要白付 ~2s**，而浏览器对 `localhost`
@@ -61,3 +65,40 @@
   快照数据本来就不会变，公式零收益、纯风险。
 - 校验入口：`.../sheetagent/.../skills/excel-generation/scripts/recalc.py <xlsx> 60`，
   只看 JSON 的 `status` 与 `total_errors`（**不能凭退出码判断**）。
+
+## 8. ⛔ 同一文件的多处编辑必须**串行** + 守卫要钉「被用上」而不是「存在」（2026-09-27 加）
+
+### 8.1 同文件并行编辑会**静默互相覆盖**
+
+同一条消息里对 `MemeKey.tsx` 发了 3 个 Edit：**全部报「成功」，实际只落地了 1 个**
+（每个 Edit 各自读旧内容再写回，后写的覆盖先写的）。
+
+- 症状极隐蔽：改动「看起来做了」，`tsc` 干净，单测全绿，
+  只有**实机探针**红（`probe-keys-anim.mjs` 的 S3）。
+- **规矩：同一文件的多处改动一次一个 Edit，等结果再发下一个。**
+  不同文件之间才可以并行。
+
+### 8.2 ⭐ `toContain('那行代码')` 只能证明「代码存在」，证明不了「被用上」
+
+第一版结构守卫断言了 `expect(src).toContain('const showPressed = pressed || externalHeld;')` ——
+**这行确实在**，而三处渲染决策读的仍是裸 `pressed`，守卫照样绿。
+
+**通用修法**：把守卫钉在**决策点**上，而不是定义处：
+
+    expect(/showPressed\s*\n\s*\?\s*'border-flame-400/.test(src)).toBe(true);   // 判据出现在分支上
+    expect(src).toContain("transform: showPressed ? pressedTransform : …");
+    expect(/^\s*pressed\s*$/m.test(src)).toBe(false);                            // 反面：多行形态
+    expect(/:\s*pressed\s*$/m.test(src)).toBe(false);
+
+**判据**：写完守卫先问一句 —— 「代码被删掉 / 被绕过 / 被判据换成别的变量，它会红吗？」
+只有「换成别的变量也会红」的守卫才算钉住了行为。
+
+### 8.3 实机探针能测到「状态对了但渲染没跟上」
+
+诊断这类问题时，逐层插桩最快，顺序是：
+① 事件有没有到 → ② handler 有没有跑（`e.defaultPrevented` 在 bubble 阶段可判）→
+③ 中间层返回值（临时插桩）→ ④ **组件状态快照**（临时 `window.__x = [...state]` + 渲染计数）→
+⑤ DOM 实际值。
+**⛔ 插桩必须带回退清理**（`grep -rn "TEMP-DIAG" src/` 应为空）。
+本次就是靠 ④ 一步定案：状态是 `[0]`、StagePage 重渲染了，但 DOM 没变 → 锁定渲染层。
+

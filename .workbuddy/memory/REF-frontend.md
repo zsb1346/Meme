@@ -451,3 +451,121 @@ spawns=0  status=ready  kind=undefined
 端到端 `scripts/roll-verify.mjs` §10（5 项，验接线 —— `__rollView.sx` 到底变没变）。
 §10 的素材是**原地改造 `takes[0]`**（两个音符拉开 17.6s），不新塞 take（见 §8 的「永远为假的守卫」）；
 并有一项**前置断言「目标不完整可见」**，否则「滚没滚」根本无从判断、五项里三项空洞绿。
+
+---
+
+## 10. 卷帘性能：三层测量法 + A/B 像素（2026-09-27）
+
+**入口**：`node scripts/probe-roll-perf.mjs <port>`（先起 dev server、跑前 `unset HTTP_PROXY …`）。
+另需 `--autoplay-policy=no-user-gesture-required`，否则播放场景的 `resume()` 被拒 →
+rAF 根本没起 → 采样 99.8% 是 `(idle)`，会被**误读成「播放很轻」**。
+
+### 三层，各管一件事
+
+| 层 | 量什么 | 用途 |
+|---|---|---|
+| ① `ops/帧` | 只数卷帘 canvas 上的绘图调用（**不是**耗时） | ⭐ **结构指标，与机器/负载无关** → 优化前后用它逐项对拍 |
+| ② 重绘帧间隔 | rAF 时间戳的**帧间隔**（不是 `performance.now()`） | 只用「排除」超载，不用「选优」 |
+| ③ CDP CPU 采样 | `Profiler.start/stop`，100µs | 点名热点函数 |
+
+⛔ **别用 `performance.now()` 量单帧耗时** —— 分辨率被钳（曾读出 0.05ms/帧 这种不可能的均值）。
+⛔ **不要**用 `canvasMs`（打桩计时）选优，只用来排除。
+
+### ⛔⛔ 第 ③ 层有个自伤：探针的插桩会污染采样
+
+①的打桩给每个 canvas 方法包了 **2 次 `performance.now()`**。于是采样里出现
+`now` 7.4%、`ctx.<computed>` 17.9%（动态包装函数，V8 给不出名字）——
+**这两块是探针自己的账**。判读时只能信非画布条目：
+`draw` / `setFill` / `setStroke` / `getGranTexture` / `beginPath` / 以及 React 的函数。
+
+### ⛔ 帧间隔有「地板」，别把它当结论
+
+headless + `--disable-gpu`（软件光栅）下，**稀疏场景也稳定 33.3ms** = 30fps 地板。
+⇒ **33.3ms 意味着「没超载」，不是「很慢」**。只有明显高于地板（如 66.7ms）才是真超载。
+配合 `ops/帧`：稀疏 531 ops 是地板、高密度 20214 ops 是 66.7ms。
+
+### 这一轮实际改了什么（`renderer.ts` / `geometry.ts` / `getTokens.ts`）
+
+1. **`withAlpha` 记忆化** → 同一个 `(hex,alpha)` 返回**同一字符串实例**，
+   `ctx.fillStyle = s` 因此短路掉重复的 CSS 颜色解析（`(program)` 的一大块）。
+2. **派生量提到帧首**（`COL` / `fontPlan`）+ **赋值去重**
+   （`setFill` / `setStroke` / `setFont`，⛔ **每次 `ctx.restore()` 后必须
+   `invalidateStyleCache()`** —— `revert` 会回滚样式，缓存不同步就会「颜色不生效」）。
+3. **几何内核拆分**（`blockWidth` / `blockHeight` / `blockTopOfEvent` 按值返回、零分配），
+   `hitTest` / `eventsInRect` / `hitResizeHandle` / 块循环全改零分配 + **最便宜判定优先**
+   （横向落空即 `continue`，连纵向都不算）。
+   风险 = 「两个入口可能不等价」→ 守卫 `geometry-equivalence.test.ts`（见下）。
+
+### ⭐ A/B 像素协议（证明「画面没变」）
+
+```
+1) AFTER ：工作区版本 → node .workbuddy/tmp/_roll-shot.mjs 5199 after.png
+2) BEFORE：git show HEAD:<file> 覆盖三件套 → 同命令 → before.png
+3) 比 MD5（两次同码截图的 MD5 必须相同 = 确定性）
+4) ⛔ 反向对照：注入一处极细微差异（`blockTopHi` alpha 0.6→0.61）→ MD5 **必须**变
+```
+
+⛔ 第 4 步不能省 —— 「能测出相同」和「测得动差异」是两件事。
+本轮结果：before = after = `b4eea609729c583fb72c089171ef8b05`（与上一轮同值，可复现）；
+反向对照 `d1fc5387…`。
+
+### `geometry-equivalence.test.ts` 的采样策略（别改回均匀网格）
+
+`hitTest` 那条原来用 17×13 的均匀网格 → **56.8 万次比较、整套负载下超时（5758ms）**。
+改成 **粗网格（61×47）+ 逐事件边界采样**（每个事件四条边的外侧/内侧、±`BLOCK_PAD_HIT`；
+外加 `GUTTER_W` / `RULER_H` 的内外两侧）→ **195ms**。
+
+理由：两条谓语的不等价**只可能出现在判据边界**上，均匀网格绝大多数点落在安全区，
+几十万次比较几乎不碰边界。守卫下界断言 `compared > 80000`（防「网格退化成空循环」的假绿）。
+
+### ⛔ 还能量什么：剩下的必须动画面（**待用户拍板**）
+
+- CPU 采样里 **React 不在热点**（`ReactElement` 0.4%、无 `beginWork`）。
+  `useTakePlaybackState` 确实挂在 `StudioPage` **根部**（注释写着「避免整页跟随 rAF
+  重渲染」而订阅就在页面上）→ 播放期间整页每帧重渲染是**真的**，
+  但**它不贵** → 按「指标只能排除」的规矩，**不修**。
+- 唯一的大头是**合批**：把 ~1800 个块各自的 `beginPath + roundRect + fill` 合成几条路径，
+  `ops/帧` 20214 → 约 11000（~45%）。
+  ⛔ **但它会改同轨重叠块的 z-order**（A 的上下高光线会被画到 B 的块体之上）→
+  **属于「动画面」→ 要用户拍板，不许单方面做。**
+- 数据密度决定一切：常规 take（几百事件）在**地板**上，只有高密度才会超载。
+
+## 11. 按键动画：多键同按 + 长按（2026-09-27 加）
+
+**契约**：`src/hooks/key-anim-state.ts` 是**纯状态内核**（无 React / 无 DOM，node 里可测）。
+`useKeyAnimations` 是它唯一的 React 壳。**按下 = 集合、闪灯 = 映射** —— 每键一份，
+粒度错了就会重现「多键同按只有一个有动画 + 不能长按」。
+
+### ⛔ 四条红线
+
+1. **「按下」不许有任何定时器。** 它是持续态，只能由**松开事件**结束。
+   旧版用一个共享的 260ms 定时器假装松手 → 按住不动也会自己弹回去。
+   `useKeyAnimations.ts` 里 `window.setTimeout` **只许出现一次**（闪灯那条），
+   且 `setPressedKeys` 只许出现 3 次（pressKey / releaseKey / clearPressed）。
+   这条**由结构守卫钉住**（纯代数测不出定时器 —— 它只是在某个时刻改状态）。
+2. **`showPressed = pressed || externalHeld`（取或），不许「外部信号说了算」。**
+   旧版 `else setPressed(false)` 让任一个键的外部信号有权清掉别的键的本地按下态。
+   ⛔ **三处渲染决策（边框色 / transform / transition）必须全部读 `showPressed`** ——
+   只写 `showPressed` 那行但决策点仍读裸 `pressed`，表现是**「键盘路径不亮、指针路径正常」**，
+   而 `toContain('showPressed = …')` 这种守卫**完全抓不住**（见 `REF-env.md §8`）。
+3. **keydown 与 keyup 的派发语义相反**（`shortcuts.ts`）：
+   - keydown：命中即**短路**；keyup：**不短路**（派发给所有匹配者 ——
+     短路会吃掉后面那些键的松开事件，它们永远卡在按下态）
+   - keydown `guardInput` 默认 **true**（打字保护）；keyup 默认 **false**
+   - keyup **不设 `when`**（门禁只该拦「按下」；拦住松开 = 卡死）
+   - keyup `keys` 可省略 = **收全部**（绑定表用户随时可改，按 `keys` 过滤会漏收；
+     松开的代价不对称：多收一次只是白跑，漏收一次就永久卡住）
+4. **让「按下态」驱动的路径不要经过「声音层」的判断。**
+   `playNote` 只在**不可演奏**时返回 `null`；`handlePress` 返回 null（KeyMachine 未就绪）
+   必须退化成哑结果 —— 否则按了绑定键毫无视觉反馈。
+   ⛔ 这个坑**只在键盘路径显形**（指针路径的本地按下态在调 `onPress` 之前就设好了）。
+
+### ⭐ 验收：只能靠实机探针
+
+- `scripts/probe-keys-anim.mjs`（14 项）：S1 鼠标长按 / S2 触摸双指同按 / S3 键盘同按。
+  读 `el.style.transform`（React 写下的**目标态**，与「有没有按下」一一对应，
+  不受过渡进度影响，不用赌时序）；按下判据是 `/scale\(0\.9[46]\)/`（兼容 reduce-motion 的 0.96）。
+- 手指/键盘同时按的场景**单测覆盖不到**：单测能证明「集合里装得下三个键」，
+  证明不了「两根手指各自派发了 pointerdown」。**连接处必须实机测。**
+- 探针三个坑（焦点 / touchEnd 点语义 / `maxTouchPoints` 1..16）→ `2026-09-27.md §G`。
+
