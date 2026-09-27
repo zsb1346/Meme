@@ -19,7 +19,7 @@ import {
   useTakePlaybackState,
   type TakePlaybackController,
 } from '../hooks/useTakePlayback';
-import { registerShortcut, isEditableTarget } from '../components/ui/shortcuts';
+import { registerKeyUp, registerShortcut } from '../components/ui/shortcuts';
 import { findKeyIndexByKey } from '../utils/key-bindings';
 import { keyPitch, isBlackMidi, isKeyPlayable, midiNoteName, KEY_BASE_MIDI } from '../model/pitch-map';
 import KeyLayout from '../components/keys/KeyLayout';
@@ -234,7 +234,7 @@ export default function StudioPage() {
   bindingsRef.current = bindings;
 
   // ---- 键盘/指针触发的按键动画（复用 StagePage 同款逻辑）----
-  const { lastFlash, lastPress, animatePress } = useKeyAnimations();
+  const { pressedKeys, flashes, pressKey, releaseKey, flashKey } = useKeyAnimations();
 
   // ---- 卷帘播放高亮（填词悬停联动已随旧面板退役） ----
   const [playHighlight, setPlayHighlight] = useState<number | null>(null);
@@ -518,26 +518,35 @@ export default function StudioPage() {
             return;
           }
           e.preventDefault();
-          animatePress(idx);
-          tapKeyRef.current(idx);
+          // 键盘路径的按下态 + 闪灯（松开见下方 studio-digit-keys-up）
+          pressKey(idx);
+          const result = tapKeyRef.current(idx);
+          if (result && result.slotIndex !== null) {
+            flashKey(idx, result.slotIndex, result.triggered);
+          }
         },
       }),
-    [bindings, bindingMode, animatePress],
+    [bindings, bindingMode, pressKey, flashKey],
   );
 
-  // 绑定键抬起 → 闭合「按住时长」（快捷键注册表只管 keydown，这里补一个受门禁的
-  // window keyup：仅录制面板可见或录制进行中生效；recorder 内部对非录制态自带门禁）
-  useEffect(() => {
-    const onKeyUp = (e: KeyboardEvent) => {
-      const m = shortcutMirrorRef.current;
-      if (m.tab !== 'record' && !m.recording) return;
-      if (isEditableTarget(e.target)) return;
-      const idx = findKeyIndexByKey(bindingsRef.current, e.key);
-      if (idx !== null) getRecorder().notifyKeyRelease(idx);
-    };
-    window.addEventListener('keyup', onKeyUp);
-    return () => window.removeEventListener('keyup', onKeyUp);
-  }, [getRecorder]);
+  // ---- 绑定键抬起 → 两件事：① 松开按键动画；② 闭合录制里的「按住时长」----
+  //  走 registerKeyUp（shortcuts.ts 规则 #4：keyup 不许裸 addEventListener）。
+  //  ⛔ 旧版这里是自建监听 + 两条门禁（「仅录制面板可见或录制中」+ 拦输入焦点）。
+  //     对动画而言这两条都是错的：它们会把「松开」这个事实吃掉 → 键位永远卡在按下态。
+  //     现在无门禁送达；录制那侧的判断交给 recorder 自己（非录制态它自返）。
+  useEffect(
+    () =>
+      registerKeyUp({
+        id: 'studio-digit-keys-up',
+        handler: (_e, key) => {
+          const idx = findKeyIndexByKey(bindingsRef.current, key);
+          if (idx === null) return;
+          releaseKey(idx);
+          getRecorder().notifyKeyRelease(idx);
+        },
+      }),
+    [releaseKey, getRecorder],
+  );
 
   // ---- 按键绑定模式：captureAll 注册（短路独占，其他快捷键不会触发）----
   const bindingTargetRef = useRef(bindingTarget);
@@ -1070,7 +1079,9 @@ export default function StudioPage() {
                         setBindingTarget(i);
                         return null;
                       } else {
-                        animatePress(i);
+                        // ⛔ 这里不许再调 pressKey：指针路径的按下态是 MemeKey 自己的
+                        //    本地状态（各实例各一份，多指同按靠它成立）。从这里再推一路
+                        //    外部信号，就是旧版「多键同按只亮一个」的成因。
                         return wrappedTapKey(i);
                       }
                     }}
@@ -1081,8 +1092,8 @@ export default function StudioPage() {
                     }}
                     binding={binding}
                     bindingTarget={bindingTarget === i}
-                    externalFlash={lastFlash?.keyIndex === i ? { slotIndex: lastFlash.slotIndex, triggered: lastFlash.triggered } : null}
-                    externalPress={lastPress?.keyIndex === i ? lastPress.pressed : undefined}
+                    externalFlash={flashes.get(i) ?? null}
+                    externalHeld={pressedKeys.has(i)}
                   />
                 );
               }}

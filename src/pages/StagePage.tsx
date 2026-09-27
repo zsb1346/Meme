@@ -29,7 +29,7 @@ import { playSynthNote } from '../engine/synth';
 import { SynthPanel } from '../components/synth/SynthPanel';
 import { findKeyIndexByKey } from '../utils/key-bindings';
 import { isKeyPlayable, keyPitch } from '../model/pitch-map';
-import { registerShortcut } from '../components/ui/shortcuts';
+import { registerKeyUp, registerShortcut } from '../components/ui/shortcuts';
 import { useKeyAnimations } from '../hooks/useKeyAnimations';
 import { useStageShare } from '../hooks/useStageShare';
 import { PageBar, Seg, Led } from '../components/ui/PageBar';
@@ -107,7 +107,7 @@ export default function StagePage() {
   const bindingsRef = useRef(bindings);
   bindingsRef.current = bindings;
 
-  const { lastFlash, lastPress, animatePress, animateFlash } = useKeyAnimations();
+  const { pressedKeys, flashes, pressKey, releaseKey, flashKey } = useKeyAnimations();
 
   // ---- 导入/导出 ----
   const { exportStage, pickFile, pending, confirm, cancel, dragOver, dragProps } =
@@ -158,8 +158,19 @@ export default function StagePage() {
   const semitoneMode = project.settings.semitoneModeEnabled;
   const setSemitoneMode = useStore((s) => s.setSemitoneMode);
 
-  /** 统一演奏入口：无论采样/电子音，都走 handlePress 推游标 + 出动画；
-   *  合成声部模式额外叠加 playSynthNote 发声（音色由音色设计面板决定）。 */
+  /**
+   * 统一演奏入口：推游标 + 发声（采样 / 电子音）。
+   *
+   * ⛔ **这里不许碰按键动画**（旧版正是在这里调 `animatePress` / `animateFlash`）。
+   *
+   *    本函数有两条调用方：指针路径（MemeKey 的 `onPress`）与键盘路径
+   *    （下方的 `stage-play-keys`）。指针路径的按下态与闪灯由 MemeKey 自己负责
+   *    （`fire()` 直接用返回值本地闪灯），键盘路径由调用方负责。
+   *
+   *    在这里统一出动画，等于给指针路径又叠了**第二路**外部信号，而旧的外部门
+   *    只有一个槽位 → 多指同按只亮一个；那个槽位还有 260ms 自动松手 → 长按也不行。
+   *    规矩：**谁发起的输入，谁负责这一路的动画**；本函数只管「声音 + 游标」。
+   */
   const playNote = useCallback(
     (keyIndex: number): MemeKeyPressResult | null => {
       /*
@@ -171,20 +182,23 @@ export default function StagePage() {
       */
       if (!isKeyPlayable(keyPitches[keyIndex], semitoneMode)) return null;
       ensureAudioStarted();
-      const result = handlePress(keyIndex);
+      /*
+        ⛔ `handlePress` 在机器未就绪时返回 null —— 那是「此刻出不了声」，
+        不是「这个键不可演奏」。若把 null 原样透出去，调用方（键盘路径）会据此
+        连按下态都不出 → 按了绑定键**毫无视觉反馈**，比「亮了但没声」更糟
+        （指针路径不受影响：MemeKey 的本地按下态在调 onPress 之前就设好了，
+        所以这个坑只在键盘路径显形 —— 探针里表现成「指针全绿、键盘全红」）。
+        所以这里退化成一个哑结果；null 只保留给「不可演奏」一种含义。
+      */
+      const result = handlePress(keyIndex) ?? { triggered: false, slotIndex: null };
       if (voiceMode === 'synth') {
         playSynthNote(keyPitches[keyIndex], {
           whenCtxSec: getAudioContext().currentTime,
         });
       }
-      // 非指针路径（键盘绑定）的按压 + 闪灯信号
-      animatePress(keyIndex);
-      if (result && result.slotIndex !== null) {
-        animateFlash(keyIndex, result.slotIndex, result.triggered);
-      }
       return result;
     },
-    [voiceMode, handlePress, animatePress, animateFlash, keyPitches, semitoneMode],
+    [voiceMode, handlePress, keyPitches, semitoneMode],
   );
 
   const previewStopsRef = useRef<PlayingSample[]>([]);
@@ -419,7 +433,9 @@ export default function StagePage() {
     });
   }, [bindingMode, setKeyBinding, clearKeyBinding]);
 
-  // ---- 演奏键位：registerShortcut（shortcuts.ts 内部拦 e.repeat → 长按只响一次）----
+  // ---- 演奏键位（按下）：registerShortcut（shortcuts.ts 内部拦 e.repeat → 长按只响一次）----
+  //      ⛔ 长按「只响一次」指**声音**，不是动画：动画由 keydown/keyup 一对事件夹着，
+  //         按住多久就亮多久（见下一条 keyup 注册）。
   useEffect(
     () =>
       registerShortcut({
@@ -432,10 +448,35 @@ export default function StagePage() {
           const keyIndex = findKeyIndexByKey(bindingsRef.current, key);
           if (keyIndex === null) return;
           e.preventDefault();
-          playNote(keyIndex);
+          const result = playNote(keyIndex);
+          if (result === null) return; // null = 这个键此刻不可演奏（半音键已收起等）→ 连按下态都不出
+          pressKey(keyIndex);
+          if (result.slotIndex !== null) {
+            flashKey(keyIndex, result.slotIndex, result.triggered);
+          }
         },
       }),
-    [bindings, bindingMode, editor, playNote],
+    [bindings, bindingMode, editor, playNote, pressKey, flashKey],
+  );
+
+  // ---- 演奏键位（松开）：闭合「按住」，这是长按能成立的那一半 ----
+  //      旧实现没有这条通道（shortcuts 只管 keydown），改用 260ms 定时器假装松手 ——
+  //      于是「按着不动」也会在 260ms 后自己弹回去。真松开必须由真事件驱动。
+  useEffect(
+    () =>
+      registerKeyUp({
+        id: 'stage-play-keys-up',
+        // ⛔ 不写 keys：接收**全部**松开。绑定表是用户随时可改的，按住的过程中
+        //    绑定若被改掉，按 keys 过滤就会漏掉这次松开 → 键位永远卡在按下态。
+        //    松开的代价是不对称的（幂等，多收只是白跑一趟），所以宁可多收。
+        // ⛔ 也不写 when：门禁只该拦「按下」。按住时切模式会让 when 变假，
+        //    那次松开被吃掉同样是卡死（见 shortcuts.ts 文件头 ③）。
+        handler: (_e, key) => {
+          const keyIndex = findKeyIndexByKey(bindingsRef.current, key);
+          if (keyIndex !== null) releaseKey(keyIndex);
+        },
+      }),
+    [releaseKey],
   );
 
   // ------------------------------------------------------------------ 水合门
@@ -567,8 +608,8 @@ export default function StagePage() {
             bindingTarget={bindingTarget}
             onBindingTargetChange={setBindingTarget}
             bindings={bindings}
-            lastFlash={lastFlash}
-            lastPress={lastPress}
+            flashes={flashes}
+            pressedKeys={pressedKeys}
           />
         )}
 

@@ -9,9 +9,24 @@
  *   以及 Space/Enter keyup 时回调，供录制侧闭合「按住时长」。
  * - 游标指示：≤12 槽位画点阵（当前游标 = 下一个要响的槽，高亮），更多则显示 n/len 计数；
  * - 刚触发的槽位短暂闪白，给出「这次轮到它了」的因果反馈。
+ *
+ * ══ 按下态有两个来源，它们**并列**而不是互相覆盖 ══
+ *
+ *   ① 指针路径：本组件自己的 `pressed`（pointerdown/up/cancel/leave 驱动）。
+ *      每个 MemeKey 实例各持一份 → 天生支持多指同按。
+ *   ② 键盘路径：父级的 `externalHeld`（绑定键 keydown/keyup 驱动）。
+ *      绑定表是全局的，只有页面知道哪个物理键对应哪个格，所以由页面下发。
+ *
+ *   显示值 = `pressed || externalHeld`。
+ *
+ *   ⛔ 旧版是「外部信号说了算」：`externalPress` 为假就无条件 `setPressed(false)`。
+ *      于是只要另一个键被按下（外部信号换了对象），这个键的按下态就被清掉 ——
+ *      手指还按着、动画已经弹回去（用户实报「同时按多个只有一个有动画」）。
+ *      两个来源取或，谁也不能清掉对方的按下；各自的松开由各自的路径负责。
  */
 
 import { useEffect, useRef, useState } from 'react';
+import { FLASH_MS } from '../../hooks/key-anim-state';
 
 export interface MemeKeyPressResult {
   /** 是否真的出声（哑触发 = false） */
@@ -40,9 +55,12 @@ export interface MemeKeyProps {
   /** 隐藏素材信息（录制模式：不显示素材名/未配置/圆点） */
   hideSlotInfo?: boolean;
   /** 外部触发闪灯（键盘绑定等非指针路径）：变化时触发一次 flash 动画 */
-  externalFlash?: { slotIndex: number; triggered: boolean } | null;
-  /** 外部触发按压动画（键盘绑定等非指针路径）：true = 按下果冻，false = 松开 */
-  externalPress?: boolean;
+  externalFlash?: { slotIndex: number | null; triggered: boolean } | null;
+  /**
+   * 外部「按住」信号（键盘绑定等非指针路径）：true = 该键此刻被物理按住。
+   * 与指针路径的本地按下态**取或**，不会互相清除（见文件头）。
+   */
+  externalHeld?: boolean;
   /** 键盘绑定的键名（如 "a", "Space" 等） */
   binding?: string;
   /** 是否为当前绑定目标（等待用户按键） */
@@ -50,7 +68,6 @@ export interface MemeKeyProps {
 }
 
 const MAX_DOTS = 12;
-const FLASH_MS = 260;
 
 /** 订阅 prefers-reduced-motion（SSR 安全：默认 false） */
 function usePrefersReducedMotion(): boolean {
@@ -81,11 +98,15 @@ export default function MemeKey({
   onRelease,
   extraBadge,
   externalFlash,
-  externalPress,
+  externalHeld = false,
   binding,
   bindingTarget,
   hideSlotInfo,
 }: MemeKeyProps) {
+  /**
+   * 指针路径的按下态。**只由本组件的指针事件改**，外部信号不碰它 ——
+   * 这正是「多指同按」在本层免费成立的原因（每个实例各一份）。
+   */
   const [pressed, setPressed] = useState(false);
   const [flash, setFlash] = useState<{ slot: number | null; ok: boolean } | null>(
     null,
@@ -95,6 +116,15 @@ export default function MemeKey({
   /** 是否处于「按下未松」状态：onRelease 只在此为真时触发一次 */
   const heldRef = useRef(false);
   const reduceMotion = usePrefersReducedMotion();
+
+  /**
+   * 最终显示值：两个来源**取或**。
+   *
+   * 键盘路径没有本地 `pressed`（keydown 不经过本组件的指针事件），
+   * 靠 `externalHeld` 驱动；指针路径没有 `externalHeld`。
+   * 取或之后，两边的松开各自负责收尾，谁也不会把对方顶掉。
+   */
+  const showPressed = pressed || externalHeld;
 
   useEffect(
     () => () => {
@@ -112,21 +142,9 @@ export default function MemeKey({
     flashTimer.current = window.setTimeout(() => setFlash(null), FLASH_MS);
   }, [externalFlash]);
 
-  // 外部触发按压果冻动画（键盘绑定等非指针路径）
-  const pressTimerRef = useRef<number | null>(null);
-  useEffect(() => {
-    if (externalPress) {
-      setPressed(true);
-    } else {
-      setPressed(false);
-    }
-    return () => {
-      if (pressTimerRef.current !== null) {
-        window.clearTimeout(pressTimerRef.current);
-        pressTimerRef.current = null;
-      }
-    };
-  }, [externalPress]);
+  // ⛔ 这里曾经有一个「externalPress 为假就 setPressed(false)」的 effect。
+  //    它让外部信号拥有了清除本地按下态的权力，正是多键同按只亮一个的根因。
+  //    现在按下态由 `showPressed = pressed || externalHeld` 派生，无需 effect。
 
   const len = slotNames.length;
   const empty = len === 0;
@@ -188,7 +206,7 @@ export default function MemeKey({
         'outline-none',
         'focus-visible:ring-2 focus-visible:ring-flame-400/70',
         black ? 'rounded-[3px] border' : 'rounded-md border',
-        pressed
+        showPressed
           ? 'border-flame-400 bg-flame-600/20 shadow-[inset_0_2px_6px_rgb(0_0_0/0.5)]'
           : black
             ? // 黑键：比白键**更深一级**的面（ink-950），像钢琴黑键沉下去。
@@ -205,12 +223,12 @@ export default function MemeKey({
       ].join(' ')}
       style={{
         touchAction: 'none',
-        transform: pressed ? pressedTransform : 'scale(1) rotate(0deg) scaleY(1)',
+        transform: showPressed ? pressedTransform : 'scale(1) rotate(0deg) scaleY(1)',
         // 按下快而软（110ms），松开用 overshoot 贝塞尔弹过头再落定 = 果冻回弹（520ms）。
         // 这个不对称是「果冻感」的全部秘密（设计系统戒律三：手）。
         transition: reduceMotion
           ? 'transform 120ms ease-out, box-shadow 120ms ease-out, background-color 120ms ease-out'
-          : pressed
+          : showPressed
             ? 'transform 110ms cubic-bezier(0.3, 0.9, 0.35, 1), box-shadow 110ms ease-out, background-color 110ms ease-out'
             : 'transform 520ms cubic-bezier(0.34, 1.56, 0.64, 1), box-shadow 260ms ease-out, background-color 260ms ease-out',
       }}
@@ -218,7 +236,7 @@ export default function MemeKey({
       {/* 键名 */}
       <span
         className={`${black ? 'text-body' : 'text-lead'} font-bold leading-none tracking-[-0.01em] transition-colors ${
-          pressed ? 'text-flame-300' : empty && !black ? 'text-label-muted' : black ? 'text-label-lo' : 'text-label-hi'
+          showPressed ? 'text-flame-300' : empty && !black ? 'text-label-muted' : black ? 'text-label-lo' : 'text-label-hi'
         }`}
       >
         {label}

@@ -16,7 +16,17 @@
  * 1. 全项目唯一允许 window.addEventListener('keydown') 的地方就是本文件。
  * 2. 任何页面/组件要键盘输入，只能 registerShortcut。
  * 3. e.repeat / guardInput / when / 通配捕获 全部在本文件统一处理。
- * 4. keyup 若要监听，必须用 registerKeyUp（后续加），禁止裸 addEventListener。
+ * 4. keyup 一律用 registerKeyUp，禁止裸 addEventListener。
+ *    （本文件也唯一允许 window.addEventListener('keyup')。）
+ *
+ * ── keydown 与 keyup 的**语义差异**（照抄 keydown 的规矩写 keyup 必出错）──
+ * ① **不短路**：keydown 命中即停（一次按键只该触发一个动作），
+ *    但 keyup 是「松开」这个事实的通知 —— 派发给**所有**匹配者。
+ *    短路会让「按住 A 的同时按住 B，松开 A」把 B 的松开事件吃掉 → B 永远卡在按下态。
+ * ② **默认不拦输入焦点**：guardInput 在 keydown 上是打字保护，在 keyup 上
+ *    只会制造「焦点在输入框时松开 → 键位卡在按下态」。默认 false。
+ * ③ **不设 when 门禁**：门禁只该拦「按下」。按住某键的过程中模式切了，
+ *    `when` 变 false，松开事件被门禁吃掉 → 同样卡住。
  */
 
 export interface ShortcutSpec {
@@ -52,8 +62,34 @@ function normalizeKey(key: string): string {
   return key === ' ' ? 'Space' : key;
 }
 
+/**
+ * keyup 注册说明。字段比 `ShortcutSpec` 少：没有 `allowRepeat` / `captureAll` /
+ * `priority` 之外的花样 —— 松开不需要「长按重复」，也不需要独占捕获。
+ */
+export interface KeyUpSpec {
+  /** 全局唯一 id；同 id 重复注册会覆盖旧的 */
+  id: string;
+  /**
+   * 关心的键名（`KeyboardEvent.key` 口径，空格写 'Space'）。
+   *
+   * **留空 = 接收所有松开**。演奏键位推荐留空：绑定表是用户随时可改的，
+   * 按住某键的过程中绑定若被改掉，按 `keys` 过滤就会漏掉这次松开。
+   * 松开的代价是不对称的 —— 多收一次只是白跑一趟（release 幂等），
+   * 漏收一次则键位永远卡在按下态。所以宁可多收。
+   */
+  keys?: string[];
+  /** 额外门禁。⛔ 慎用：拦掉松开 = 卡在按下态（见文件头 ③） */
+  when?: () => boolean;
+  /** 焦点在输入框等可编辑元素时是否忽略。**默认 false**（与 keydown 相反，见文件头 ②） */
+  guardInput?: boolean;
+  handler(event: KeyboardEvent, key: string): void;
+}
+
 /** 判断事件目标是否处于可编辑控件中（打字保护用） */
 export function isEditableTarget(target: EventTarget | null): boolean {
+  // node（vitest）里没有 HTMLElement，`null instanceof HTMLElement` 会直接抛
+  // （右操作数不是对象）。此处退化为「不可编辑」，让本文件在无 DOM 环境下可用。
+  if (typeof HTMLElement === 'undefined') return false;
   if (!(target instanceof HTMLElement)) return false;
   return (
     target.tagName === 'INPUT' ||
@@ -149,4 +185,78 @@ export function registerShortcut(spec: ShortcutSpec): () => void {
 export function unregisterAllShortcuts(): void {
   registry.clear();
   maybeRemoveListener();
+  upRegistry.clear();
+  maybeRemoveKeyUpListener();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// keyup 通道
+// ═══════════════════════════════════════════════════════════════════════════
+
+interface UpRegistration {
+  spec: KeyUpSpec;
+  seq: number;
+}
+
+const upRegistry = new Map<string, UpRegistration>();
+let upSeqCounter = 0;
+let upListenerInstalled = false;
+
+/**
+ * keyup 派发 —— **不短路**（文件头 ①）。
+ *
+ * 单独导出是为了能在没有 DOM 的测试环境里直接驱动这条路径：
+ * 本仓库的 vitest 跑在 node（无 jsdom），`window` 不存在，
+ * 监听器的安装是空操作，但派发逻辑本身仍然可以被逐条断言。
+ */
+export function dispatchKeyUp(event: KeyboardEvent, key: string): void {
+  const candidates: UpRegistration[] = [];
+  for (const entry of upRegistry.values()) {
+    const wanted = entry.spec.keys;
+    if (wanted !== undefined && wanted.length > 0) {
+      if (!wanted.some((k) => normalizeKey(k) === key)) continue;
+    }
+    candidates.push(entry);
+  }
+
+  // 顺序只影响可观测的副作用次序；因为不短路，次序不影响「谁收到了」
+  candidates.sort((a, b) => b.seq - a.seq);
+
+  for (const { spec } of candidates) {
+    if (spec.when && !spec.when()) continue;
+    if ((spec.guardInput ?? false) && isEditableTarget(event.target)) continue;
+    spec.handler(event, key);
+  }
+}
+
+function handleKeyUp(event: KeyboardEvent): void {
+  dispatchKeyUp(event, normalizeKey(event.key));
+}
+
+function ensureKeyUpListener(): void {
+  if (upListenerInstalled) return;
+  if (typeof window === 'undefined') return; // node 测试环境：只保证注册表可用
+  window.addEventListener('keyup', handleKeyUp);
+  upListenerInstalled = true;
+}
+
+function maybeRemoveKeyUpListener(): void {
+  if (!upListenerInstalled || upRegistry.size > 0) return;
+  window.removeEventListener('keyup', handleKeyUp);
+  upListenerInstalled = false;
+}
+
+/**
+ * 注册一个全局 keyup。返回注销函数（effect cleanup 时调用）。
+ *
+ * ⛔ 只用于**闭合「按住」状态**（释放视觉按下态 / 补写录音时长），
+ *    不要用它做「松手才算确认」的动作键 —— 那是 keydown 的活。
+ */
+export function registerKeyUp(spec: KeyUpSpec): () => void {
+  upRegistry.set(spec.id, { spec, seq: ++upSeqCounter });
+  ensureKeyUpListener();
+  return () => {
+    upRegistry.delete(spec.id);
+    maybeRemoveKeyUpListener();
+  };
 }

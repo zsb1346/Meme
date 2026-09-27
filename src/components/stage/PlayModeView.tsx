@@ -105,10 +105,10 @@ export interface PlayModeViewProps {
   bindingTarget: number | null;
   onBindingTargetChange: (keyIndex: number | null) => void;
   bindings: Record<number, string>;
-  /** 外部闪灯信号（键盘绑定触发时由父级传入） */
-  lastFlash: { keyIndex: number; slotIndex: number; triggered: boolean } | null;
-  /** 外部按压信号（键盘绑定触发时由父级传入） */
-  lastPress: { keyIndex: number; pressed: boolean } | null;
+  /** 外部闪灯信号（键盘绑定触发时由父级传入）——**每键一份**，可同时多个 */
+  flashes: ReadonlyMap<number, { slotIndex: number | null; triggered: boolean }>;
+  /** 外部按住信号（键盘绑定触发时由父级传入）——**是一个集合**，可同时按住多个键 */
+  pressedKeys: ReadonlySet<number>;
 }
 
 function IconBtn({
@@ -162,8 +162,8 @@ export default function PlayModeView({
   bindingTarget,
   onBindingTargetChange,
   bindings,
-  lastFlash,
-  lastPress,
+  flashes,
+  pressedKeys,
 }: PlayModeViewProps) {
   /** 键域起点音高（新工程恒为 C3；迁移过的老工程可能略有不同） */
   const baseMidi = keyPitches?.[0] ?? KEY_BASE_MIDI;
@@ -415,12 +415,12 @@ export default function PlayModeView({
                       : undefined
                 }
                 extraBadge={bindingMode ? (boundKey ?? (isBindingTarget ? '…' : '')) : undefined}
-                externalFlash={
-                  lastFlash?.keyIndex === i
-                    ? { slotIndex: lastFlash.slotIndex, triggered: lastFlash.triggered }
-                    : null
-                }
-                externalPress={lastPress?.keyIndex === i ? lastPress.pressed : undefined}
+                /* 映射里没有这一项 = 该键此刻没在闪；有则原样透传条目对象
+                   （⛔ 不要在这里现拼对象 —— 引用每次都会变，MemeKey 会误判成
+                   「又触发了一次」，每次渲染都重放闪灯动画）。 */
+                externalFlash={flashes.get(i) ?? null}
+                /* 按住是一个集合：集合里有它就是按住。多键同按天然成立。 */
+                externalHeld={pressedKeys.has(i)}
               />
             );
           }}
