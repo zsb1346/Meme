@@ -256,6 +256,51 @@ export function revealLane(
   return clampViewState({ ...view, sy }, l);
 }
 
+/**
+ * 横向「聚焦」时的落地边距：滚完之后块不贴视口边，左右各留一点上下文。
+ *
+ * ⚠️ 只影响**落地位置**，不影响**触发条件**（触发仍是「块完整地在视口外」）。
+ * 若拿它当触发阈值，那么只要音符靠近右缘就会开始滚，用户会看到
+ * 「音明明还在屏幕上，视图却自己动了」—— 与「超出显示区域才聚焦」不符。
+ */
+export const REVEAL_MARGIN_PX = 24;
+
+/**
+ * 让某个音符块横向进入可视区（纯函数，`revealLane` 在**时间轴**上的对应物）。
+ *
+ * 触发：块**完整可见**时原样返回（同一个对象，调用方可直接用 `!==` 判断动没动）；
+ * 只有块整体越过左缘或右缘时才平移 `sx`。
+ * 落地：滚到「块 + `REVEAL_MARGIN_PX` 边距」刚好进视口，块比可视区还宽时左缘对齐
+ * （看得到音头比看得到音尾有用）。
+ *
+ * 与 `revealLane` 一样走 `blockSize` / `timeToX`，所以「聚焦到的位置」与
+ * 绘制、命中测试永远是同一套公式。
+ */
+export function revealBlockX(
+  view: ViewState,
+  tSec: number,
+  durationSec: number | undefined,
+  l: RollLayout,
+): ViewState {
+  const { bw } = blockSize(l.rowH, view.pps, durationSec);
+  const x = timeToX(tSec, view);
+  // 判「完整可见」用**视口本身**（不含边距）—— 边距只决定落地位置
+  if (x >= GUTTER_W && x + bw <= l.w) return view;
+  const fitBand = l.viewW - REVEAL_MARGIN_PX * 2;
+  const headX = GUTTER_W + REVEAL_MARGIN_PX;
+  let sx = view.sx;
+  if (fitBand <= 0 || bw > fitBand) {
+    // 块比可视区还宽（或视口太窄）：左缘对齐，至少能看到音头
+    sx = view.sx + (x - headX);
+  } else if (x < GUTTER_W) {
+    sx = view.sx + (x - headX);
+  } else {
+    sx = view.sx + (x + bw - (l.w - REVEAL_MARGIN_PX));
+  }
+  if (sx === view.sx) return view;
+  return clampViewState({ ...view, sx }, l);
+}
+
 /* ═══════════════════════════════════════════════════════════════════════
    时间刻度
    ═══════════════════════════════════════════════════════════════════════ */

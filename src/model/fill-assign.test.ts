@@ -15,6 +15,7 @@ import { describe, expect, it } from 'vitest';
 
 import { applyAssignment, computeMatrix } from './fill-assign';
 import type { Key, Project, SampleId, TakeEvent } from './types';
+import { DEFAULT_SYNTH_PATCH } from '../engine/synth/patch';
 
 // ---------------------------------------------------------------------------
 // 测试夹具工厂
@@ -90,6 +91,7 @@ function makeProject(keys: Key[]): Project {
       keyBindings: {},
       autoTuneEnabled: true,
       semitoneModeEnabled: false,
+      synthPatch: { ...DEFAULT_SYNTH_PATCH },
     },
     updatedAtMs: 0,
   };

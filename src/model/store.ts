@@ -17,6 +17,15 @@ import type {
 } from './types';
 import { uid } from '../utils/uid';
 import { DEFAULT_REVERB_SETTINGS } from '../engine/effect-units/reverb-defaults';
+import {
+  DEFAULT_SYNTH_PATCH,
+  sanitizeSynthPatch,
+  type SynthPatch,
+} from '../engine/synth/patch';
+import {
+  loadSynthPatch as loadSynthPatchToEngine,
+  setSynthPatch as pushSynthPatchToEngine,
+} from '../engine/synth';
 import { cacheBuffer, decodeAudioBlobShared, dropCachedBuffer } from '../engine/sample-player';
 import {
   KEY_BASE_MIDI,
@@ -154,6 +163,14 @@ export function migrateProject(raw: Project | null): Project | null {
     ...DEFAULT_SETTINGS,
     ...p.settings,
     keyBindings: p.settings?.keyBindings ?? {},
+    /*
+      合成音色单独再走一次归一。
+      浅合并只能保证「整个字段缺失」时回落默认值；而老存档（或手工改过的
+      存档）完全可能只有一个残缺的 synthPatch 对象 —— 里面缺 60 个键。
+      缺键是 `undefined`，而 `undefined` 喂给 `AudioParam` 会抛 TypeError、
+      抛点在渲染期 → 整页黑屏。所以这里必须补全，不能靠浅合并。
+    */
+    synthPatch: sanitizeSynthPatch(p.settings?.synthPatch ?? DEFAULT_SYNTH_PATCH),
   };
 
   /*
@@ -252,6 +269,11 @@ export const DEFAULT_SETTINGS: Settings = {
   autoTuneEnabled: true,
   /** 半音键（黑键）是否显示 —— 纯视图开关，不参与键集/音域的任何计算 */
   semitoneModeEnabled: false,
+  /**
+   * 出厂音色 = 「参考音 · 清铃」（干、短、单薄）—— 它是**跟弹参考音**，
+   * 不是氛围音色：带长尾巴的参考音会把拍点糊掉。想要氛围随手换预设。
+   */
+  synthPatch: { ...DEFAULT_SYNTH_PATCH },
 };
 
 /** 出厂默认标签图案（旧唱名制）：do / do' / do″…；迁移时仅改写匹配此图案的 */
@@ -400,6 +422,12 @@ interface AppState {
   setKeyCount(count: number): void;
   /** 半音键（黑键）显示开关 —— 纯视图状态，不改键集、不改音域、不改音符 */
   setSemitoneMode(enabled: boolean): void;
+  /**
+   * 写入合成声部音色（音色设计面板的出口）。
+   * 传部分字段即浅合并；结果一律过 `sanitizeSynthPatch` 后同步引擎与存档。
+   * 只影响试听/按键反馈，不影响导出。
+   */
+  setSynthPatch(patch: Partial<SynthPatch>, opts?: { load?: boolean }): void;
   setKeyBinding(keyIndex: number, key: string): void;
   clearKeyBinding(keyIndex: number): void;
   clearAllKeyBindings(): void;
@@ -489,6 +517,14 @@ export const useStore = create<AppState>()((set, get) => ({
     set(() => {
       // 老存档迁移统一走 migrateProject（含 3 段 EQ → 多段 bands 的转换）
       const p = migrateProject(project) ?? createDefaultProject();
+      /*
+        音色要跟着存档走。
+        引擎侧单独持有一份 patch（为了「上下文还没建时也能记音色」），
+        换工程时不推一次，就会继续用上一个工程的音色 —— 而面板显示的是
+        新工程的值，于是「看得见的是 A、听得见的是 B」。
+        这里不建 AudioContext（push 内部只在引擎已存在时才下发）。
+      */
+      pushSynthPatchToEngine(p.settings.synthPatch);
       return {
         hydrated: true,
         project: p,
@@ -679,6 +715,42 @@ export const useStore = create<AppState>()((set, get) => ({
         settings: { ...s.project.settings, semitoneModeEnabled: enabled },
       }),
     })),
+
+  /**
+   * 写入合成声部音色（音色设计面板）。
+   *
+   * 三件事一起做，缺一不可：
+   *   ① 与新值浅合并后**过 sanitize**（面板拖动只传一个键，靠这里补全+夹取）；
+   *   ② 同步推给引擎（引擎侧那份 patch 是发声真正读的东西）；
+   *   ③ 落进 project.settings → 随存档持久化。
+   *
+   * ⚠️ 面板侧对「拖动」另有 120ms 尾随防抖：store 一写就会让选了整个
+   * `project` 的组件重渲染（制作台整页，含卷帘画布），不能每个 pointermove
+   * 都写。这里的即时性由面板的草稿层保证，不靠本函数。
+   */
+  /**
+   * 写入音色。
+   *
+   * `opts.load = true` 表示「整份装载」（切预设 / 重置 / 存档 hydrate）——
+   * 引擎侧会顺带清掉宏基准（见 `engine/synth/index.ts::loadSynthPatch`）。
+   * 面板的 120ms 尾随落库**不能**带这个标记：它写进去的 patch 里已经带着
+   * 宏联动出来的值，清基准会让下一次拖宏从「已被宏改过的值」出发、指数漂移。
+   */
+  setSynthPatch: (patch, opts) =>
+    set((s) => {
+      const next = sanitizeSynthPatch({
+        ...s.project.settings.synthPatch,
+        ...(patch as Partial<SynthPatch>),
+      });
+      if (opts?.load) loadSynthPatchToEngine(next);
+      else pushSynthPatchToEngine(next);
+      return {
+        project: touch({
+          ...s.project,
+          settings: { ...s.project.settings, synthPatch: next },
+        }),
+      };
+    }),
 
   setKeyBinding: (keyIndex, key) =>
     set((s) => ({

@@ -6,6 +6,10 @@
  * `createdAtMs` / `updatedAtMs` 仅为元数据展示，不参与任何音频调度。
  */
 
+// 合成声部音色的类型来自引擎层（方向：model → engine，与 reverb 默认值一致）。
+// 纯类型导入，不引入任何运行时代码。
+import type { SynthPatch } from '../engine/synth/patch';
+
 /** 素材唯一标识 */
 export type SampleId = string;
 /**
@@ -291,6 +295,17 @@ export interface Settings {
    *   挤掉别人的位置 —— 那是布局层读了开关导致的，已废弃。）
    */
   semitoneModeEnabled: boolean;
+  /**
+   * 合成声部音色（音色设计面板的产物）。
+   *
+   * ⚠️ 它只服务**试听与按键反馈**（空槽键兜底声、录制跟弹参考音），
+   * 与主效果链物理隔离，**不进导出** —— 所以音色怎么改都不会动到成品。
+   *
+   * 随工程存档持久化；读取时一律过 `sanitizeSynthPatch`（缺键补默认、
+   * 越界夹取、非有限值回落）。65 个数字参数里任何一个 `undefined`
+   * 都足以让 `AudioParam` 抛错、进而整页黑屏 —— 这道闸不能省。
+   */
+  synthPatch: SynthPatch;
 }
 
 /** Project 工程 —— 全部状态容器、持久化单位 */

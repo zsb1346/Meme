@@ -6,7 +6,7 @@
  *  - ensureAudioStarted + resume；
  *  - TakePlayer 构造（project/take/destination 每次启动现取，README §10.3）；
  *  - 声部可切换（getVoice：采样 = TakePlayer 默认路径 / 合成 = playEvent 注入
- *    triggerSynthNoteAt），两种声部共用 TakePlayer 的单一 lookahead 时钟；
+ *    playSynthNote），两种声部共用 TakePlayer 的单一 lookahead 时钟；
  *  - 播放头直接读 TakePlayer.getPositionSec()（与音频同钟，唯一权威读数）；
  *  - onEventScheduled → 事件下标回调（卷帘高亮联动）；
  *  - 手动停止 / 自然播完统一复位快照并回调 onEnded。
@@ -19,8 +19,9 @@ import { useSyncExternalStore } from 'react';
 import { ensureAudioStarted } from '../engine/core';
 import { getCachedBuffer } from '../engine/sample-player';
 import { TakePlayer } from '../engine/take-player';
-import { triggerSynthNoteAt, releaseAllSynth } from '../engine/synth-preview';
+import { playSynthNote, releaseAllSynthNotes } from '../engine/synth';
 import type { AudioDestination } from '../engine/key-machine';
+import { keyPitchAt } from '../model/pitch-map';
 import { resolveSemitonesIn } from '../model/pitch-resolve';
 import type { Project, Take } from '../model/types';
 
@@ -42,7 +43,7 @@ export interface TakePlaybackOptions {
   getDestination(): AudioDestination;
   /**
    * 每次启动现读声部：'sample' = 填词采样（TakePlayer 默认路径）
-   * / 'synth' = 合成骨架（playEvent 注入 triggerSynthNoteAt）。
+   * / 'synth' = 合成骨架（playEvent 注入 playSynthNote）。
    * 省略时恒为 'sample'（既有调用方零影响）。
    */
   getVoice?(): 'sample' | 'synth';
@@ -147,10 +148,11 @@ export function createTakePlayback(
           resolveSemitonesIn(project, id, targetPitchMidi),
         // 合成声部：注入 playEvent 走同一 lookahead 时钟，高亮逐音符渐进。
         // 音高用事件自身的 pitch（卷帘拖动/装配改写过的也如实反映），
-        // 缺省才回落 keyIndex 的旧下标映射。
+        // 缺省才回落键位序列（keyPitchAt —— 不再有「下标锚点」第二套映射）。
         playEvent:
           voice === 'synth'
-            ? (ev, when) => triggerSynthNoteAt(ev.keyIndex, when, ev.pitch)
+            ? (ev, when) =>
+                playSynthNote(ev.pitch ?? keyPitchAt(ev.keyIndex), { whenCtxSec: when })
             : undefined,
         callbacks: {
           onEventScheduled: (ev) => {
@@ -188,7 +190,7 @@ export function createTakePlayback(
         player = null;
       }
       // 合成音符止鸣（采样模式无单例声部，调用无害）
-      releaseAllSynth();
+      releaseAllSynthNotes();
       setIdle();
     },
 

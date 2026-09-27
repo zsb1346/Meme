@@ -31,7 +31,7 @@ export interface TakePlayerOptions {
   resolveSemitones(id: SampleId, targetPitchMidi?: number): number;
   /**
    * 可注入声部：提供时每个事件改由 playEvent(ev, when) 发声
-   * （合成试听传 triggerSynthNoteAt），绕过默认采样路径；
+   * （合成试听传 playSynthNote），绕过默认采样路径；
    * onEventScheduled 照常渐进回调，播放头数学不变。
    */
   playEvent?(ev: TakeEvent, whenCtxSec: number): void;

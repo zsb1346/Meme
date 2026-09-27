@@ -1,26 +1,26 @@
-import * as Tone from 'tone';
 import type { Take, TakeEvent } from '../model/types';
 import { getAudioContext } from './core';
-import { midiToHz } from './pitch';
 import { keyPitchAt } from '../model/pitch-map';
+import { playSynthNote, setSynthChannelMuted } from './synth';
 import { uid } from '../utils/uid';
 
 /**
  * 录制（计划 §4.3）：
  * - 事件时间戳一律取 audioContext.currentTime（相对录制起点），禁用 Date.now()
- * - 按键同时触发「真实音准钢琴反馈音」（按 Key.pitchMidi 定音高）
+ * - 按键同时触发「真实音准的跟弹参考音」（按 Key.pitchMidi 定音高）
  * - 两段式按住时长：notifyKeyPress 记录事件（duration 留空），notifyKeyRelease
  *   在松开时用音频时钟补写 duration（秒）；播放/导出暂不消费该字段
- * - 反馈音走独立 gain 直连输出，绝不进主效果链、绝不进导出渲染
+ * - 参考音的音色由**合成声部**提供（`engine/synth`，音色设计面板可调），
+ *   走独立干路、绝不进主效果链、绝不进导出渲染
  */
 
 /**
  * 键位 → MIDI 音高的**兜底**。
  *
- * ⚠️ 新代码一律传 `Key.pitchMidi`（notifyKeyPress / playFeedback /
- * triggerSynthNoteAt 的第三参）。本函数只在「调用方拿不到键对象」时兜底 ——
- * 键集恒为「从键域起点 C3 起的连续半音序列」，所以兜底就是 `keyPitchAt`
- * （**逐半音**，与键位矩阵上的真实音高逐点一致）。
+ * ⚠️ 新代码一律传 `Key.pitchMidi`（`notifyKeyPress` / `playFeedback` 的第二参）。
+ * 本函数只在「调用方拿不到键对象」时兜底 —— 键集恒为「从键域起点 C3 起的
+ * 连续半音序列」，所以兜底就是 `keyPitchAt`（**逐半音**，与键位矩阵上的
+ * 真实音高逐点一致）。
  *
  * 旧实现兜底到「C4 起的自然音序列」（lane 1 → D4），在半音键集上会差
  * 整整一个音 —— 那种偏差听着只是「有点不对」，极难定位。
@@ -30,50 +30,15 @@ export function keyIndexToMidi(keyIndex: number): number {
 }
 
 /**
- * 钢琴反馈音源：PolySynth 三角波 + 快衰减包络（轻量合成，避免 CDN 采样依赖）。
- * 独立 bus 直连 Tone Destination —— 与效果链物理隔离。
+ * 跟弹参考音的发声时长（秒）。与旧实现一致：够听清音准，不至于拖到下一个音。
  */
-class FeedbackPiano {
-  private synth: Tone.PolySynth | null = null;
-  private bus: Tone.Gain | null = null;
-
-  private ensure(): void {
-    if (this.synth && this.bus) return;
-    this.bus = new Tone.Gain(0.9).toDestination();
-    this.synth = new Tone.PolySynth(Tone.Synth, {
-      oscillator: { type: 'triangle' },
-      envelope: { attack: 0.003, decay: 0.45, sustain: 0.06, release: 1.0 },
-      volume: -9,
-    });
-    this.synth.connect(this.bus);
-  }
-
-  play(keyIndex: number, pitchMidi?: number): void {
-    this.ensure();
-    const synth = this.synth;
-    if (!synth) return;
-    const freq = midiToHz(pitchMidi ?? keyIndexToMidi(keyIndex));
-    synth.triggerAttackRelease(freq, 0.5, Tone.now());
-  }
-
-  setMuted(muted: boolean): void {
-    this.bus?.gain.rampTo(muted ? 0 : 0.9, 0.03);
-  }
-
-  dispose(): void {
-    this.synth?.dispose();
-    this.bus?.dispose();
-    this.synth = null;
-    this.bus = null;
-  }
-}
+export const FEEDBACK_DURATION_SEC = 0.5;
 
 export class TakeRecorder {
   private events: TakeEvent[] = [];
   private pressCounts: number[] = [];
   private startTime = 0;
   private running = false;
-  private readonly feedback = new FeedbackPiano();
 
   /** 开始一段新录制（重复调用安全：进行中则忽略）。 */
   start(): void {
@@ -115,13 +80,21 @@ export class TakeRecorder {
   }
 
   /**
-   * 播放钢琴反馈音（跟弹参考音）。
+   * 播放跟弹参考音（录制时的「这是我该按的音」）。
    * 只有需要"跟弹"语义的调用方显式调用 —— 目前是"录制中且采样已发声"。
    * 独立于 notifyKeyPress，避免 recorder 内部发声与调用方的发声叠加。
+   *
+   * ⚠️ 音色来自**合成声部**（音色设计面板那套），且走 `'feedback'` 通道：
+   * 通道静音只掐这一路，不会连坐试听声。
    * @param pitchMidi 该键的固定音高（Key.pitchMidi）；缺省回落旧下标映射
    */
   playFeedback(keyIndex: number, pitchMidi?: number): void {
-    this.feedback.play(keyIndex, pitchMidi);
+    playSynthNote(pitchMidi ?? keyIndexToMidi(keyIndex), {
+      durationSec: FEEDBACK_DURATION_SEC,
+      // 参考音要压过素材本身才叫「参考」——旧实现也是满力度
+      velocity: 1,
+      channel: 'feedback',
+    });
   }
 
   /**
@@ -171,13 +144,18 @@ export class TakeRecorder {
     this.pressCounts = [];
   }
 
-  /** 静音/恢复反馈音（如用户不想听钢琴声）。 */
+  /** 静音/恢复跟弹参考音（如用户不想听参考声）。走通道静音，不影响试听声。 */
   setFeedbackMuted(muted: boolean): void {
-    this.feedback.setMuted(muted);
+    setSynthChannelMuted('feedback', muted);
   }
 
+  /**
+   * 放弃录制并释放本实例持有的东西。
+   *
+   * ⚠️ **不 dispose 合成引擎**：引擎是模块级单例，由 `engine/synth` 持有，
+   * 这里只是它的一个使用者。旧实现自带一份 PolySynth 才需要在这里销毁。
+   */
   dispose(): void {
     this.cancel();
-    this.feedback.dispose();
   }
 }

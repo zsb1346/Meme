@@ -141,6 +141,28 @@ export function visibleKeyCount(
     : pitches.reduce((n, p) => n + (isDiatonicMidi(p) ? 1 : 0), 0);
 }
 
+/**
+ * 这个键此刻**能不能出声** —— 判据就是「它上不上屏」。
+ *
+ * 半音键收起（`semitoneEnabled === false`）时黑键不摆位（`KeyLayout.hideBlackKeys`），
+ * 但它**仍然留在 `project.keys` 里**：切换半音开关不许移动/删除任何已有键
+ * （否则切回来整台琴的音高全变）。于是它的**键盘绑定会照旧触发** ——
+ * 用户看到的现象是「屏幕上压根没有这个键，按下去却有声音」。
+ *
+ * ⛔ 判据必须与摆位**同源**（黑键由**音高**决定，不是下标），否则两边迟早各说一套。
+ * `pitch` 传 `undefined` = 这个下标根本不存在（键域收窄后留下的陈旧绑定）→ 同样不许出声。
+ *
+ * ⚠️ 传进来的一律是 `keyPitch()` 解析过的音高。**不要在调用点自己读 `pitchMidi`** ——
+ * 旧存档里 `pitchMidi` 可能缺失，直接读会把整台琴的绑定全判成「不可弹」。
+ */
+export function isKeyPlayable(
+  pitch: number | undefined,
+  semitoneEnabled: boolean,
+): boolean {
+  if (pitch === undefined || !Number.isFinite(pitch)) return false;
+  return semitoneEnabled || isDiatonicMidi(pitch);
+}
+
 // ---------------------------------------------------------------------------
 // 音域档位
 // ---------------------------------------------------------------------------

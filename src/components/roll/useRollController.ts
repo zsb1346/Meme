@@ -40,6 +40,13 @@
  *    · `Ctrl/⌘ + Z` 撤销；`Ctrl/⌘ + Shift + Z` 重做
  *    · `Shift + A` 打开装配面板（保留旧行为）
  *
+ *  【键盘弹奏 —— 只发合成声，绝不触发素材播放】
+ *    · `A W S E D F T G Y H U J K O L P ;` → 半音阶梯试听（按住延音）
+ *    · `Z` / `X` → 基准八度下移 / 上移（会响一声新基准作为听觉反馈）
+ *    · 左侧钢琴栏**点击**也走同一条路：点亮该行 + 出同一个声
+ *    · 带 `Ctrl/⌘/Alt` 的组合键一律放行给编辑快捷键；输入框聚焦时不拦截
+ *      （左右两侧也因此**分职**：左栏 = 发声试听，时间线 = 编辑。见下）
+ *
  *  颜色经 styles/getTokens 读取设计令牌（与 CSS 同源）。
  *  Props 契约：受控模式（take + onChange）。
  */
@@ -53,7 +60,7 @@ import { useStore } from '../../model/store';
 import { midiNoteName } from '../../model/pitch-map';
 import { getTokens } from '../../styles/getTokens';
 import { getAudioContext, ensureAudioStarted } from '../../engine/core';
-import { triggerSynthPitchAt } from '../../engine/synth-preview';
+import { playSynthNote, releaseSynthNote } from '../../engine/synth';
 import {
   DRAG_THRESHOLD_PX,
   GUTTER_W,
@@ -76,6 +83,7 @@ import {
   pickTimeStep,
   pitchOfLane,
   rebuildPressCounts,
+  revealBlockX,
   revealLane,
   subdivisionsFor,
   takeDuration,
@@ -85,6 +93,30 @@ import {
 } from './geometry';
 import { draw } from './renderer';
 import type { GhostPreview, MarqueeRect } from './renderer';
+import {
+  KEYBOARD_OCTAVE_DOWN,
+  KEYBOARD_OCTAVE_UP,
+  KEYBOARD_SEMITONES,
+  isTypingTarget,
+  keyboardBasePitch as keyboardBasePitchOf,
+  resolveKeyboardNote as resolveKeyboardNoteOf,
+} from './keyboard-play';
+
+/* ═══════════════ 电脑键盘弹奏（「音乐打字」布局）═══════════════
+ *
+ * 用户诉求：**在卷帘里按键盘就能弹出声音，且只发合成声、不碰素材**。
+ * 所以这里只调 `playSynthNote` / `releaseSynthNote` —— 卷帘从不触发采样
+ * 播放，那是播放与导出的职责（`take-player` / `sample-player`）。
+ * 改本文件时请守住这条：一旦引入采样声，用户按一个键会同时听到
+ * 「参考音 + 素材」两响。回归：`roll-synth-only.test.ts`。
+ *
+ * 键位 → 音高的换算全在 `keyboard-play.ts`（纯函数、有单测，
+ * 含「按 X 必须真的移得动基准」这类安静 bug 的断言）；
+ * 本文件只负责「监听键盘 / 起音 / 收声 / 点亮那一行」。
+ *
+ * 按住的时长见 `KEYBOARD_HOLD_SEC`，收声靠 keyup。
+ */
+const KEYBOARD_HOLD_SEC = 30;
 
 /** RollCanvas 受控契约 */
 export interface RollCanvasProps {
@@ -252,6 +284,29 @@ export function useRollController(props: RollCanvasProps) {
   /** 拖动换道试听的上次发声时间戳（毫秒）——间隔 < 0.5s 不重复发声 */
   const lastPreviewTimeRef = useRef(0);
 
+  /* ── 电脑键盘弹奏的状态（见文件头的【键盘弹奏】契约）── */
+  /** 此刻被按住的键道行；渲染层每帧读它画高亮 */
+  const pressedRef = useRef<Set<number>>(new Set());
+  /**
+   * `KeyboardEvent.code` → 实际发出的 { 音高, 键道行 }。
+   *
+   * 为什么不用「keyup 时再算一遍」：基准八度可能在中途被 `Z`/`X` 改掉，
+   * 重算会算出另一个音 → 收错声、熄错灯（真实可复现：按住 A → 按 X →
+   * 松 A，重算得到基准+12 的音，原来那个音就一直挂着）。
+   */
+  const heldKeysRef = useRef<Map<string, { pitch: number; lane: number }>>(new Map());
+  /** 弹奏基准音；null = 尚未初始化（首次按下时落到 C4，见 keyboardBasePitch） */
+  const kbdBaseRef = useRef<number | null>(null);
+  /**
+   * `Z`/`X` 处理函数被执行的次数（只用于诊断，见 `__rollKeys.shifts`）。
+   *
+   * 「按了 X 没反应」有两种完全不同的原因：按键没进处理函数（监听/守卫问题），
+   * 或者进了但被键域边界夹住。**两者在画面上完全一样**，只有计数能分开。
+   */
+  const kbdShiftsRef = useRef(0);
+  /** 左侧钢琴栏按住态（松手时清高亮） */
+  const gutterPressRef = useRef<{ pointerId: number; lane: number } | null>(null);
+
   /**
    * 编辑反馈发声（放置音符 / 拖动换道时）。
    *
@@ -260,7 +315,7 @@ export function useRollController(props: RollCanvasProps) {
    *      拦截提示（浏览器要求手势内 resume；指针事件算手势，但拖动过程中
    *      反复调用 resume 会打日志、也无意义）。
    *   2. 时长给短（0.18s），连点/连续换道不糊成一片。
-   *   3. 力度下限 0.55（见 synth-preview），保证低力度音符也听得见。
+   *   3. 力度下限 0.55：单点一个音时音量偏轻就听不清音准，编辑时等于没反馈。
    */
   const previewPitch = useCallback((midi: number, velocity = 0.8) => {
     try {
@@ -270,11 +325,162 @@ export function useRollController(props: RollCanvasProps) {
         ensureAudioStarted();
         return;
       }
-      triggerSynthPitchAt(midi, ctx.currentTime, 0.18, velocity);
+      playSynthNote(midi, {
+        whenCtxSec: ctx.currentTime,
+        durationSec: 0.18,
+        velocity: Math.min(1, Math.max(0.55, velocity)),
+      });
     } catch {
       /* 音频不可用（未解锁 / 被策略拦截）时静默降级，绝不影响编辑 */
     }
   }, []);
+
+  /* ═══════════════════ 电脑键盘弹奏（只发合成声） ═══════════════════ */
+
+  /** 当前键域的音高列表（权威值 lanePitches；缺省回落旧下标映射） */
+  const lanePitchesNow = useCallback((): number[] => {
+    const p = srcRef.current.lanePitches;
+    if (p && p.length > 0) return p;
+    return Array.from({ length: keyCountRef.current }, (_, i) => pitchOfLane(i));
+  }, []);
+
+  /**
+   * 弹奏基准音（= `A` 键发出的音高）。
+   * 换算（含「必须吸附到键域内的 C」「X 必须真的移得动」）在
+   * `keyboard-play.keyboardBasePitch`，本处只补上 ref 里记的偏好值。
+   */
+  const keyboardBasePitch = useCallback(
+    (): number => keyboardBasePitchOf(lanePitchesNow(), kbdBaseRef.current),
+    [lanePitchesNow],
+  );
+
+  /**
+   * 半音偏移 → 该响哪个键（音高 + 键道行）。
+   * 实现在 `keyboard-play.resolveKeyboardNote`：先精确匹配，匹配不到
+   * 落到最接近的键 —— 保证**没有死键**（自然音模式下 W/E/T/Y/U 仍有落点）。
+   */
+  const resolveKeyboardNote = useCallback(
+    (semitone: number): { lane: number; pitch: number } =>
+      resolveKeyboardNoteOf(lanePitchesNow(), keyboardBasePitch(), semitone),
+    [keyboardBasePitch, lanePitchesNow],
+  );
+
+  useEffect(() => {
+    const held = heldKeysRef.current;
+    const pressed = pressedRef.current;
+
+    const pressLane = (lane: number, on: boolean) => {
+      if (on) pressed.add(lane);
+      else pressed.delete(lane);
+      dirtyRef.current = true;
+    };
+
+    /**
+     * 按住发声。与 `previewPitch` 同一套解锁策略（音频没 running 时只在
+     * 用户手势内 resume、本次不发声），区别只在时长：这里给
+     * `KEYBOARD_HOLD_SEC`，真正的收声交给 `keyup` —— 弦乐/铺底类音色
+     * 「按多久响多久」才对，用默认 0.5s 会被「到点自动收」掐断手感。
+     */
+    const startNote = (pitch: number) => {
+      try {
+        const ctx = getAudioContext();
+        if (ctx.state !== 'running') {
+          ensureAudioStarted();
+          return;
+        }
+        playSynthNote(pitch, {
+          whenCtxSec: ctx.currentTime,
+          durationSec: KEYBOARD_HOLD_SEC,
+          velocity: 0.85,
+        });
+      } catch {
+        /* 音频不可用时静默降级，弹奏不该阻断编辑 */
+      }
+    };
+
+    /** 全部收声 + 熄灯（失焦 / 卸载） */
+    const quiet = () => {
+      const pitches = new Set<number>();
+      for (const v of held.values()) pitches.add(v.pitch);
+      pitches.forEach((p) => releaseSynthNote(p));
+      held.clear();
+      if (pressed.size > 0) {
+        pressed.clear();
+        dirtyRef.current = true;
+      }
+    };
+
+    const onKeyDown = (e: KeyboardEvent) => {
+      // 带修饰键的组合一律放行给编辑快捷键（Ctrl+A 全选等）
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
+      /* Shift 也整体让位：`Shift+A` 是「打开装配面板」的既有快捷键，
+         若同时按音乐打字处理，一次按键会既弹一声又弹开面板。 */
+      if (e.shiftKey) return;
+      if (isTypingTarget(e.target)) return;
+      // 弹层（音色面板 / 装配面板）开着时不弹奏：听不见也看不见，误触只会更糟
+      if (document.querySelector('[role="dialog"]')) return;
+      // 长按的自动重复只发一次音（引擎侧同音重触发会把自己掐掉）
+      if (e.repeat) return;
+      // 已经按着的键：不重复起音（同 code 不会走到这，保险起见）
+      const code = e.code;
+
+      const shift =
+        code === KEYBOARD_OCTAVE_DOWN ? -1 : code === KEYBOARD_OCTAVE_UP ? 1 : 0;
+      if (shift !== 0) {
+        e.preventDefault();
+        const cur = keyboardBasePitch();
+        kbdBaseRef.current = cur + shift * 12;
+        /* 用 ref 重算一遍 = 「实际生效的值」。两个作用：
+             ① 基准始终存**已生效**的值，不留下一个「延迟生效的意图」
+                （否则窄键域里按 X 看似没反应，之后一旦加宽键域，
+                音区会自己跳一个八度 —— 用户没有按任何键）；
+             ② 能判断这次按键是否真的动了 —— 没动就不必重绘。 */
+        const applied = keyboardBasePitch();
+        kbdBaseRef.current = applied;
+        kbdShiftsRef.current += 1;
+        /* ⛔ 必须标脏，且**无条件**标。
+           `Z`/`X` 不改任何键道行、也不起声源，很容易漏掉这一步；漏了的症状是
+           「按了 X 之后画面停在上一帧」—— 平时看不出来（别的操作迟早会重绘），
+           一旦有东西依赖重绘（读数、调试快照）就错。与其判断「值变没变」，
+           不如一律重绘：一次按键一帧，代价可以忽略，换来的是「状态永远可观测」。 */
+        dirtyRef.current = true;
+        // 让耳朵听到新基准的位置：比任何读数都直接，也省掉一个 UI
+        previewPitch(resolveKeyboardNote(0).pitch, 0.9);
+        return;
+      }
+
+      const semi = KEYBOARD_SEMITONES[code];
+      if (semi === undefined) return;
+      e.preventDefault();
+      if (held.has(code)) return;
+      const note = resolveKeyboardNote(semi);
+      held.set(code, note);
+      pressLane(note.lane, true);
+      startNote(note.pitch);
+    };
+
+    const onKeyUp = (e: KeyboardEvent) => {
+      const entry = held.get(e.code);
+      if (!entry) return;
+      held.delete(e.code);
+      /* 还有别的键落在同一个音高上（自然音模式下白键两侧的按键会吸附到
+         同一个键）→ 不能收声、也不能熄灯，否则另一个键还按着就断了。 */
+      for (const v of held.values()) if (v.pitch === entry.pitch) return;
+      releaseSynthNote(entry.pitch);
+      pressLane(entry.lane, false);
+    };
+
+    window.addEventListener('keydown', onKeyDown);
+    window.addEventListener('keyup', onKeyUp);
+    // 切窗口 / 切标签页时 keyup 收不到，会留下挂住的长音
+    window.addEventListener('blur', quiet);
+    return () => {
+      window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('keyup', onKeyUp);
+      window.removeEventListener('blur', quiet);
+      quiet();
+    };
+  }, [keyboardBasePitch, previewPitch, resolveKeyboardNote]);
 
   const [selInfo, setSelInfo] = useState<SelectedInfo>({ count: 0, single: null });
 
@@ -577,6 +783,8 @@ export function useRollController(props: RollCanvasProps) {
       keyLabels: p.keyLabels,
       lanePitches: p.lanePitches,
       blackLanesDisabled: p.blackLanesDisabled,
+      // 直接给 Set 本身：Set.has 是 O(1)，不必每帧把按下集转成数组
+      pressedLanes: pressedRef.current,
       colors: getTokens(),
       marquee: marqueeRef.current,
       ghost: ghostRef.current,
@@ -611,7 +819,27 @@ export function useRollController(props: RollCanvasProps) {
       viewH: l.viewH,
       keyCount: l.keyCount,
     };
-  }, [currentLayout]);
+
+    /*
+      弹奏状态快照，同样供自动化验证读取。
+      为什么要单独挂：键盘按下是**瞬时**状态，截图很难稳定抓到
+      （要靠时序运气），而探针真正想断言的是「按了 A 之后第几行被点亮、
+      基准音是多少、有没有真的起音」—— 这几个都是数字。
+    */
+    (cv as HTMLCanvasElement & { __rollKeys?: unknown }).__rollKeys = {
+      pressed: [...pressedRef.current],
+      base: keyboardBasePitch(),
+      /**
+       * `Z`/`X` 处理函数被执行过几次。
+       *
+       * 与 `base` 一起看才能定位「按了没反应」：`shifts` 不动 = 按键根本没进
+       * 处理函数（监听没挂上 / 被守卫吃掉）；`shifts` 动了而 `base` 没动 =
+       * 进了但被键域边界夹住。只暴露 `base` 时这两种长得一模一样。
+       */
+      shifts: kbdShiftsRef.current,
+      held: heldKeysRef.current.size,
+    };
+  }, [currentLayout, keyboardBasePitch]);
 
   const drawRef = useRef(renderFrame);
   useEffect(() => {
@@ -805,6 +1033,27 @@ export function useRollController(props: RollCanvasProps) {
         return;
       }
 
+      /* ── 左侧钢琴栏：按住 = 试听该行音高（只发合成声）+ 点亮该行 ──
+         刻意在**命中测试之前**返回：左栏是「键盘」，点它是弹一个音，
+         不是编辑。它不进入拖拽/框选状态机 —— 否则在左栏横拖会框选、
+         竖拖会平移，一个想弹琴的用户会得到一堆意外的选区。
+         左右分职：左栏发声试听，时间线区才编辑。 */
+      if (pos.x < GUTTER_W) {
+        const lane = yToLane(pos.y, v, l, keyCountRef.current);
+        if (lane !== null) {
+          const pitch = srcRef.current.lanePitches?.[lane] ?? pitchOfLane(lane);
+          // 半音键已收起 → 这一格「按不了」，与键盘上的表现保持一致
+          if (!(srcRef.current.blackLanesDisabled && isBlackPitch(pitch))) {
+            gutterPressRef.current = { pointerId: e.pointerId, lane };
+            pressedRef.current.add(lane);
+            // 力度给满：单点一个音时偏轻就听不清音准，等于没反馈
+            previewPitch(pitch, 1);
+            dirtyRef.current = true;
+          }
+        }
+        return;
+      }
+
       const idx = hitTestAt(pos.x, pos.y);
       const t = takeRef.current;
 
@@ -904,6 +1153,7 @@ export function useRollController(props: RollCanvasProps) {
       currentLayout,
       flushDragBuffer,
       hitTestAt,
+      previewPitch,
       selectSingle,
       syncSelInfo,
       toggleSelection,
@@ -930,6 +1180,9 @@ export function useRollController(props: RollCanvasProps) {
         dirtyRef.current = true;
         return;
       }
+
+      /* 左栏按住：整段手势只发声 + 高亮，不接受拖动语义 */
+      if (gutterPressRef.current) return;
 
       /* 标尺 scrub */
       const scrub = scrubRef.current;
@@ -1072,6 +1325,14 @@ export function useRollController(props: RollCanvasProps) {
     (e: ReactPointerEvent<HTMLCanvasElement>) => {
       pointersRef.current.delete(e.pointerId);
       if (pinchRef.current && pointersRef.current.size < 2) pinchRef.current = null;
+
+      /* 左栏按住态松手 → 熄掉那一行的高亮（声音是短音，自己会收） */
+      const gp = gutterPressRef.current;
+      if (gp && gp.pointerId === e.pointerId) {
+        gutterPressRef.current = null;
+        pressedRef.current.delete(gp.lane);
+        dirtyRef.current = true;
+      }
 
       const drag = dragRef.current;
       if (drag && e.pointerId === drag.pointerId) {
@@ -1298,11 +1559,17 @@ export function useRollController(props: RollCanvasProps) {
       selectSingle(nextIdx);
       const ev = t.events[nextIdx];
       if (ev) {
-        const nv = revealLane(
-          viewRef.current,
-          laneOf(ev, keyCountRef.current),
-          currentLayout(),
+        const l = currentLayout();
+        // 纵 + 横都要露出：左右键是按时间顺序切换音符，目标很可能在视口
+        // 之外的时间段上 —— 只做纵向 reveal 时表现为「按了左右键但画面没动」
+        // （选中变了、看不见，用户会以为按键失灵）。
+        const nv = revealBlockX(
+          revealLane(viewRef.current, laneOf(ev, keyCountRef.current), l),
+          ev.tSec,
+          ev.duration,
+          l,
         );
+        viewRef.current.sx = nv.sx;
         viewRef.current.sy = nv.sy;
       }
       dirtyRef.current = true;

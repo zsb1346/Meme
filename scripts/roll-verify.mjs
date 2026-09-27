@@ -12,6 +12,7 @@ import { spawn } from 'node:child_process';
 import { mkdtempSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { APP_IMPORT_BOOTSTRAP, storeIdentityCheckSource } from './_app-import.mjs';
 
 const PORT = Number(process.argv[2] ?? 5199);
 const URL = `http://localhost:${PORT}/`;
@@ -119,10 +120,24 @@ try {
     return r.result.value;
   };
 
+  /* ── 0. 先装「拿到 App 那个模块实例」的解析器 ──
+     见 `_app-import.mjs`：HMR 之后模块 URL 带 `?t=`，裸路径 import 会拿到
+     另一个 store 实例（探针写进影子 store → 页面没反应 → 假红）。 */
+  await evalJs(APP_IMPORT_BOOTSTRAP);
+
+  /* ── 0b. 先证明「探针拿到的 store」就是「App 在渲染的那个 store」 ──
+     ⛔ 这条必须先过。否则后面所有注入都写进影子 store，失败会伪装成
+     「卷帘挂了」这种产品 bug（见 `_app-import.mjs` 的长注释）。 */
+  {
+    const idc = await evalJs(storeIdentityCheckSource('roll-verify'));
+    check('store 实例 = App 正在用的那个', idc.ok, idc.detail);
+    if (!idc.ok) throw new Error('store 实例不一致，后续注入都不可信：' + idc.detail);
+  }
+
   /* ── 1. 注入测试 take 并切到制作台 ── */
   await evalJs(`
     (async () => {
-      const m = await import('/src/model/store.ts');
+      const m = await window.__appImport('/src/model/store.ts');
       const S = m.useStore;
       const st = S.getState();
       const take = m.createEmptyTake('验证骨架');
@@ -143,15 +158,22 @@ try {
       take.durationSec = t;
       S.setState({ project: { ...st.project, takes: [take, ...st.project.takes] } });
       /*
-        必须同时选中这个 take —— 只塞进 project.takes 是不够的。
-        制作台在「没有选中的 take」时渲染的是空状态（钢琴卷帘还空着 +
-        导入 MIDI / 录制演奏 两个引导按钮），**不会挂载 canvas**，
-        于是脚本报「找不到卷帘 canvas」。这是测试的疏漏，不是应用的问题。
-      */
-      if (typeof S.getState().setSelectedTakeId === 'function') {
-        S.getState().setSelectedTakeId(take.id);
-      }
-      /*
+        注入完必须让它真的显示出来：制作台在「没有选中的 take」时渲染的是
+        空状态（卷帘还空着 + 导入 MIDI / 录制演奏 两个引导按钮），
+        **不会挂载 canvas**，于是脚本报「找不到卷帘 canvas」。
+
+        ⛔ 别在这里找 setSelectedTakeId —— store 上**没有**这个东西。
+        「选中的是哪个 take」是各页面自己的 useState（StagePage / StudioPage
+        都一样），从 store 够不着；制作台挂载后会把 takes[0] 落到选中位，
+        所以**注入到数组头部**就是让新 take 被显示的唯一手段。
+
+        反例档案：这里曾经写着
+            if (typeof S.getState().setSelectedTakeId === 'function') { … }
+        看着像「兼容两版 API」，实际**永远为假**、静默什么都不做。靠
+        「takes[0] 自动选中」碰巧还能跑，于是没人发现；直到 §10 依赖它切换
+        take 时，探针就在**别人的 take** 上白测了两项（详见 §10 注释）。
+        ⛔ 守卫只有在两种分支都可达时才配存在；永远为假的守卫 = 谎言。
+
         切页要点导航按钮，不要用 store 的 setActivePage：实测后者不生效
         （页面仍停在素材箱）。点按钮与用户真实操作一致。
       */
@@ -309,7 +331,7 @@ try {
 
   /* ── 5. 左键点击空白 → 插入音符 ── */
   const addTest = await evalJs(`(async () => {
-    const m = await import('/src/model/store.ts');
+    const m = await window.__appImport('/src/model/store.ts');
     const before = m.useStore.getState().project.takes[0].events.length;
     const cv = document.querySelector('canvas.touch-none');
     const r = cv.getBoundingClientRect();
@@ -363,7 +385,7 @@ try {
 
   /* ── 7. Delete 删除选中 ── */
   const delTest = await evalJs(`(async () => {
-    const m = await import('/src/model/store.ts');
+    const m = await window.__appImport('/src/model/store.ts');
     const before = m.useStore.getState().project.takes[0].events.length;
     const host = document.querySelector('div[tabindex="0"]');
     if (!host) return { before, after: before, err: 'no-host' };
@@ -380,7 +402,7 @@ try {
 
   /* ── 8. Ctrl+Z 撤销 ── */
   const undoTest = await evalJs(`(async () => {
-    const m = await import('/src/model/store.ts');
+    const m = await window.__appImport('/src/model/store.ts');
     const before = m.useStore.getState().project.takes[0].events.length;
     const host = document.querySelector('div[tabindex="0"]');
     host.dispatchEvent(new KeyboardEvent('keydown', { key: 'z', ctrlKey: true, bubbles: true }));
@@ -394,32 +416,169 @@ try {
     `事件数 ${undoTest.before} → ${undoTest.after}`,
   );
 
-  /* ── 9. 右键点击音符 = 删除 ── */
+  /* ── 9. 右键点击音符 = 删除 ──
+     ⛔ 必须挑一个**此刻真的落在画布矩形内**的音符再点。早先版本硬点
+     `events[0]`，而第 4 节的纵向缩放会把视图滚走（实测 sy=157、rowH=35.6），
+     于是那个音符的行落在画布**上边界之外**（y=84 < 画布 top=94）——
+     指针事件打进了空气，删除当然不发生，红得像是功能坏了。
+     「点在元素外面却断言状态变化」是探针最常见的假红。 */
   const rmbTest = await evalJs(`(async () => {
-    const m = await import('/src/model/store.ts');
+    const m = await window.__appImport('/src/model/store.ts');
     const cv = document.querySelector('canvas.touch-none');
     if (!cv) return 'NO-CANVAS';
     const before = m.useStore.getState().project.takes[0].events.length;
     const r = cv.getBoundingClientRect();
     const v = cv.__rollView;
     const RULER = 22, GUTTER = 60;
-    const ev = m.useStore.getState().project.takes[0].events[0];
-    if (!ev) return 'NO-EVENT';
-    // 命中该音符块的左端（留 3px 内缩，避开可能的外扩命中区）
-    const x = r.left + GUTTER + ev.tSec * v.pps - v.sx + 3;
-    const y = r.top + RULER + ev.keyIndex * v.rowH - v.sy + v.rowH / 2;
+    const events = m.useStore.getState().project.takes[0].events;
+    // 命中点 = 音符块左端内缩 3px / 行中线；与 geometry.laneOf 同一映射（lane = keyIndex）
+    const hits = events.map((ev, i) => ({
+      i, ev,
+      x: r.left + GUTTER + ev.tSec * v.pps - v.sx + 3,
+      y: r.top + RULER + ev.keyIndex * v.rowH - v.sy + v.rowH / 2,
+    })).filter((h) => h.x > r.left + GUTTER && h.x < r.right - 6
+                   && h.y > r.top + RULER && h.y < r.bottom - 4);
+    if (hits.length === 0) return 'NO-VISIBLE-EVENT';
+    const hit = hits[0];
     cv.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true,
       composed: true, pointerId: 55, pointerType: 'mouse', isPrimary: true,
-      button: 2, buttons: 2, clientX: x, clientY: y }));
+      button: 2, buttons: 2, clientX: hit.x, clientY: hit.y }));
     await new Promise(z => setTimeout(z, 400));
     const after = m.useStore.getState().project.takes[0].events.length;
-    return JSON.stringify({ before, after });
+    return JSON.stringify({ before, after, hit: { i: hit.i, keyIndex: hit.ev.keyIndex,
+      tSec: hit.ev.tSec, x: Math.round(hit.x), y: Math.round(hit.y) } });
   })()`);
   if (typeof rmbTest === 'string' && rmbTest.startsWith('{')) {
     const rmb = JSON.parse(rmbTest);
-    check('右键点击音符 = 删除', rmb.after === rmb.before - 1, `事件数 ${rmb.before} → ${rmb.after}`);
+    check('右键点击音符 = 删除', rmb.after === rmb.before - 1,
+      `事件数 ${rmb.before} → ${rmb.after}（点 keyIndex=${rmb.hit.keyIndex} tSec=${rmb.hit.tSec} @ ${rmb.hit.x},${rmb.hit.y}）`);
   } else {
     check('右键点击音符 = 删除', false, String(rmbTest));
+  }
+
+  /* ── 10. 左右键切换音符 → 目标在视口外时自动横向聚焦 ──
+     为什么必须测在这一层：`reveal-block-x.test.ts` 只钉住纯数学（滚多少）。
+     真正会坏的是**接线** —— 方向键处理器里到底有没有把 sx 写回 viewRef。
+     坏掉的现象是「选中变了、画面就是不动」，跟按键失灵长得一模一样，
+     而 `__rollView.sx` 有没有变是把这两者分开的唯一数字。
+
+     ⛔ 本节的素材必须**原地改造当前显示的那个 take**（`takes[0]`），
+     不能另塞一个新 take 进数组头再指望它被选中：制作台的 `selectedTakeId`
+     是页面私有 state，store 上够不着（见 §1 的反例档案）。早先版本正是这么
+     写的，于是这一段跑在**上一个 take 的 18 个音符**上 —— 那些音符全在
+     视口内，按 → 当然不滚，红得毫无信息量。 */
+  const focusTest = await evalJs(`(async () => {
+    const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+    const m = await window.__appImport('/src/model/store.ts');
+    const S = m.useStore;
+    const st = S.getState();
+    const cur = st.project.takes[0];
+    if (!cur) return 'NO-TAKE';
+    // 原地替换（id 不变 → 制作台不会切走）：两个音符拉开 17.6s，
+    // 足以制造「目标在视口之外」的场面。
+    const T0 = 0.4, T1 = 18;
+    const DUR = 0.4;
+    const t = {
+      ...cur,
+      events: [
+        { keyIndex: 3, pressCount: 1, tSec: T0, pitch: 63, duration: DUR, velocity: 0.8 },
+        { keyIndex: 5, pressCount: 1, tSec: T1, pitch: 65, duration: DUR, velocity: 0.8 },
+      ],
+      durationSec: T1 + 0.8,
+    };
+    S.setState({ project: { ...st.project, takes: [t, ...st.project.takes.slice(1)] } });
+    await wait(700);
+
+    const cv = document.querySelector('canvas.touch-none');
+    if (!cv) return 'NO-CANVAS';
+    const host = cv.closest('div[tabindex="0"]') || document.querySelector('div[tabindex="0"]');
+    if (!host) return 'NO-HOST';
+    host.focus();
+
+    const GUTTER = 60;
+    /* 某音符此刻在视口里的位置 —— 与 geometry.timeToX / blockSize 同公式 */
+    const posOf = (tSec, dur) => {
+      const v = cv.__rollView;
+      const r = cv.getBoundingClientRect();
+      const x = GUTTER + tSec * v.pps - v.sx;
+      const bw = Math.max(8, dur * v.pps);
+      return { x, right: x + bw, bw, w: r.width, sx: v.sx, pps: v.pps,
+               vis: x >= GUTTER && x + bw <= r.width };
+    };
+
+    /* 目标必须**不完整可见**，否则「滚没滚」根本无从判断。
+       用工具栏「横向放大」按钮放大它（与用户操作一致）；放大后它只会更靠右，
+       所以这个循环一定会退出。 */
+    const zoomIn = [...document.querySelectorAll('button')]
+      .find((b) => (b.getAttribute('aria-label') || '').startsWith('横向放大'));
+    if (!zoomIn) return 'NO-ZOOM-BUTTON';
+    let clicks = 0;
+    while (clicks < 14 && posOf(T1, DUR).vis) {
+      zoomIn.click();
+      await wait(140);
+      clicks++;
+    }
+    const before = {
+      n1: posOf(T0, DUR),
+      n2: posOf(T1, DUR),
+      zoomClicks: clicks,
+    };
+
+    const press = (key) => host.dispatchEvent(new KeyboardEvent('keydown', {
+      key, bubbles: true, cancelable: true,
+    }));
+
+    press('Escape');                       // 清选中：第一次按 → 落到最早的音符
+    await wait(180);
+    press('ArrowRight');
+    await wait(320);
+    const atN1 = posOf(T0, DUR);
+
+    press('ArrowRight');                   // 跳到 18s 那个（原本在视口外）
+    await wait(320);
+    const atN2 = posOf(T1, DUR);
+
+    press('ArrowLeft');                    // 往回
+    await wait(320);
+    const backN1 = posOf(T0, DUR);
+
+    const sxIdleBefore = cv.__rollView.sx; // 已在最早音符上再按 ← ：不许抖
+    press('ArrowLeft');
+    await wait(320);
+    const sxIdleAfter = cv.__rollView.sx;
+
+    return JSON.stringify({ before, atN1, atN2, backN1, sxIdleBefore, sxIdleAfter });
+  })()`);
+  if (typeof focusTest === 'string' && focusTest.startsWith('{')) {
+    const f = JSON.parse(focusTest);
+    const rd = (n) => Math.round(n);
+    check(
+      '前置：第二个音符不完整可见（否则「滚没滚」无从判断）',
+      !f.before.n2.vis,
+      `放大 ${f.before.zoomClicks} 次，x=${rd(f.before.n2.x)} 宽=${rd(f.before.n2.bw)} 视口宽 ${rd(f.before.n2.w)}`,
+    );
+    check(
+      '按 → 选中最早音符（它本来就在视口里）',
+      f.atN1.vis,
+      `x=${rd(f.atN1.x)} 右缘=${rd(f.atN1.right)} 视口宽 ${rd(f.atN1.w)}`,
+    );
+    check(
+      '⛔ 目标在视口外时按 → 自动横向滚动（sx 变了）且目标完整可见',
+      f.atN2.vis && f.atN2.sx !== f.before.n2.sx,
+      `sx ${rd(f.before.n2.sx)} → ${rd(f.atN2.sx)}，x=${rd(f.atN2.x)}`,
+    );
+    check(
+      '按 ← 回到上一个音符，同样聚焦进视口',
+      f.backN1.vis,
+      `x=${rd(f.backN1.x)} 右缘=${rd(f.backN1.right)}`,
+    );
+    check(
+      '已在最早音符上按 ← 不抖（选中不变 → 视图不动）',
+      f.sxIdleBefore === f.sxIdleAfter,
+      `sx ${rd(f.sxIdleBefore)} → ${rd(f.sxIdleAfter)}`,
+    );
+  } else {
+    check('左右键横向聚焦', false, String(focusTest));
   }
 
   const passed = results.filter((r) => r.pass).length;

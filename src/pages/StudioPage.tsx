@@ -21,17 +21,18 @@ import {
 } from '../hooks/useTakePlayback';
 import { registerShortcut, isEditableTarget } from '../components/ui/shortcuts';
 import { findKeyIndexByKey } from '../utils/key-bindings';
-import { keyPitch, isBlackMidi, midiNoteName, KEY_BASE_MIDI } from '../model/pitch-map';
+import { keyPitch, isBlackMidi, isKeyPlayable, midiNoteName, KEY_BASE_MIDI } from '../model/pitch-map';
 import KeyLayout from '../components/keys/KeyLayout';
 import MemeKey, { type MemeKeyPressResult } from '../components/keys/MemeKey';
 import NotePalette from '../components/fill/NotePalette';
 import { EffectPopup } from '../components/ui/EffectPopup';
+import { SynthPanel } from '../components/synth/SynthPanel';
 import { buildCommitPatch } from './studio-commit';
 import RollCanvas from '../components/roll/RollCanvas';
 import ExportDialog from './ExportDialog';
 import { formatTime } from '../utils/format';
 import { toast } from '../components/ui/toast';
-import { triggerSynthNoteAt } from '../engine/synth-preview';
+import { playSynthNote } from '../engine/synth';
 import { useKeyAnimations } from '../hooks/useKeyAnimations';
 import { parseMidiFile, buildMidiTake, type ParsedMidiFile } from '../engine/midi-import';
 import MidiImportModal from '../components/stage/MidiImportModal';
@@ -255,6 +256,8 @@ export default function StudioPage() {
   }, []);
   // ---- 全局效果器弹层（自旧填词面板行内迁移至卷帘传输槽） ----
   const [fxOpen, setFxOpen] = useState(false);
+  /** 音色设计面板（合成声部）—— 解决「兜底声/跟弹参考音难听」的那一层 */
+  const [synthOpen, setSynthOpen] = useState(false);
 
   // ---- 自动修音全局开关 ----
   const autoTuneEnabled = useStore((s) => s.project.settings.autoTuneEnabled);
@@ -439,11 +442,20 @@ export default function StudioPage() {
 
       // ④ 发声：四分支互斥，绝不叠加
       if (result.triggered) {
-        // 采样已发声 → 录制中补钢琴跟弹（参考音），非录制不补
+        // 采样已发声 → 录制中补跟弹参考音，非录制不补
         if (ev) getRecorder().playFeedback(keyIndex, pitchMidi);
       } else {
-        // 采样哑（空键 / 缓冲未就绪 / 静音模式）→ 电子音兜底
-        triggerSynthNoteAt(pitchMidi, getAudioContext().currentTime);
+        /*
+          采样哑（空槽键 / 缓冲未就绪 / 静音模式）→ 合成声兜底。
+
+          ⚠️ 这里曾经写成 `triggerSynthNoteAt(pitchMidi, currentTime)`：
+          旧签名是 `(keyIndex, whenCtxSec, pitchMidi?)`，于是 MIDI 音号被当成
+          **键下标**，再由 `keyPitchAt(48) = 96` 推出高 4 个八度的音 ——
+          按下 C3 听到 C7，越靠近 C8 错得越少（被音域上限夹住）。
+          两个参数都是 number，编译器一声不吭。
+          新 API 第一参就是音高本身、其余全部具名，这个错误写不出来。
+        */
+        playSynthNote(pitchMidi);
       }
 
       return { triggered: result.triggered, slotIndex: result.slotIndex };
@@ -492,12 +504,22 @@ export default function StudioPage() {
           !shortcutMirrorRef.current.paletteOpen && !bindingMode,
         handler: (e, key) => {
           if (e.repeat) return;   // 双保险（shortcuts 内部已拦，这里显式声明语义）
-          const idx = findKeyIndexByKey(useStore.getState().project.settings.keyBindings, key);
-          if (idx !== null && idx < useStore.getState().project.keys.length) {
-            e.preventDefault();
-            animatePress(idx);
-            tapKeyRef.current(idx);
+          const st = useStore.getState();
+          const idx = findKeyIndexByKey(st.project.settings.keyBindings, key);
+          if (idx === null) return;
+          /*
+            ⛔ 与演奏台同一条规矩：**屏幕上没有的键不许出声**。
+            半音开关关闭时黑键不摆位（`hideBlackKeys`），但它仍在键集里
+            （切换开关不许动已有键），绑定照旧触发 → 用户「按了个看不见的键，居然响了」。
+            音高一律经 `keyPitch()` 解析（旧存档可能没有 `pitchMidi`）。
+          */
+          const k = st.project.keys[idx];
+          if (!isKeyPlayable(k ? keyPitch(k, idx) : undefined, st.project.settings.semitoneModeEnabled)) {
+            return;
           }
+          e.preventDefault();
+          animatePress(idx);
+          tapKeyRef.current(idx);
         },
       }),
     [bindings, bindingMode, animatePress],
@@ -1171,6 +1193,17 @@ export default function StudioPage() {
                     <IconEffects size={13} />
                     FX
                   </button>
+
+                  <button
+                    type="button"
+                    onClick={() => setSynthOpen(true)}
+                    aria-label="音色设计"
+                    title="打开音色设计（合成声部：兜底声与跟弹参考音的音色）"
+                    className="flex h-[26px] items-center gap-1.5 rounded-sm px-2 text-tiny font-medium text-label-muted transition-colors hover:bg-ink-800 hover:text-flame-300"
+                  >
+                    <IconWaveform size={13} />
+                    音色
+                  </button>
                 </>
               }
               onChange={(updatedTake) => {
@@ -1290,6 +1323,9 @@ export default function StudioPage() {
 
       {/* 全局效果器弹层（自旧填词面板迁移；卷帘传输槽唤起） */}
       {fxOpen && <EffectPopup open={fxOpen} onClose={() => setFxOpen(false)} />}
+
+      {/* 音色设计弹层（合成声部）—— 与效果器同级、但改的是另一条链 */}
+      <SynthPanel open={synthOpen} onClose={() => setSynthOpen(false)} />
     </section>
   );
 }

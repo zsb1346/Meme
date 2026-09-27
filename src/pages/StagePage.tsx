@@ -25,9 +25,10 @@ import EditMatrixView from '../components/stage/EditMatrixView';
 import SlotEditorModal, { type EditorTarget } from '../components/stage/SlotEditorModal';
 import ImportConfirmModal from '../components/stage/ImportConfirmModal';
 import { toast } from '../components/ui/toast';
-import { triggerSynthNoteAt } from '../engine/synth-preview';
+import { playSynthNote } from '../engine/synth';
+import { SynthPanel } from '../components/synth/SynthPanel';
 import { findKeyIndexByKey } from '../utils/key-bindings';
-import { keyPitch } from '../model/pitch-map';
+import { isKeyPlayable, keyPitch } from '../model/pitch-map';
 import { registerShortcut } from '../components/ui/shortcuts';
 import { useKeyAnimations } from '../hooks/useKeyAnimations';
 import { useStageShare } from '../hooks/useStageShare';
@@ -68,6 +69,8 @@ export default function StagePage() {
 
   // ---- 演奏模式：声部 / Take / 按键绑定 ----
   const [voiceMode, setVoiceMode] = useState<'audio' | 'synth'>('audio');
+  /** 音色设计弹层：只在「电子音」声部下有入口（采样不经过合成器） */
+  const [synthOpen, setSynthOpen] = useState(false);
   const [selectedTakeId, setSelectedTakeId] = useState<TakeId | null>(() => {
     const takes = project.takes;
     return takes.length > 0 ? takes[0].id : null;
@@ -150,18 +153,29 @@ export default function StagePage() {
     setSelectedTakeId(take.id);
   }, [addTake, project.takes.length]);
 
+  const keyCount = project.settings.keyCount;
+  /** 半音键开关：只决定黑键摆不摆（纯视图状态，不动键集与音域） */
+  const semitoneMode = project.settings.semitoneModeEnabled;
+  const setSemitoneMode = useStore((s) => s.setSemitoneMode);
+
   /** 统一演奏入口：无论采样/电子音，都走 handlePress 推游标 + 出动画；
-   *  电子音模式额外叠加 triggerSynthNoteAt 发声。 */
+   *  合成声部模式额外叠加 playSynthNote 发声（音色由音色设计面板决定）。 */
   const playNote = useCallback(
     (keyIndex: number): MemeKeyPressResult | null => {
+      /*
+        ⛔ 收起的键不许还能弹（用户报：「关闭半音模式后，绑到半音键的键盘还能按响」）。
+        半音键关闭时黑键不摆位，但它**仍在键集里**（切换开关不许动已有键），
+        于是它的键盘绑定照旧触发 —— 屏幕上没有这个键、按下却有声音。
+        判据用 `isKeyPlayable`（与摆位同源：黑键由音高决定），
+        而不是在这条路径上读 `semitoneMode` 自己拼一个条件。
+      */
+      if (!isKeyPlayable(keyPitches[keyIndex], semitoneMode)) return null;
       ensureAudioStarted();
       const result = handlePress(keyIndex);
       if (voiceMode === 'synth') {
-        triggerSynthNoteAt(
-          keyIndex,
-          getAudioContext().currentTime,
-          keyPitches[keyIndex],
-        );
+        playSynthNote(keyPitches[keyIndex], {
+          whenCtxSec: getAudioContext().currentTime,
+        });
       }
       // 非指针路径（键盘绑定）的按压 + 闪灯信号
       animatePress(keyIndex);
@@ -170,16 +184,11 @@ export default function StagePage() {
       }
       return result;
     },
-    [voiceMode, handlePress, animatePress, animateFlash, keyPitches],
+    [voiceMode, handlePress, animatePress, animateFlash, keyPitches, semitoneMode],
   );
 
   const previewStopsRef = useRef<PlayingSample[]>([]);
   const previewTimerRef = useRef<number | null>(null);
-
-  const keyCount = project.settings.keyCount;
-  /** 半音键开关：只决定黑键摆不摆（纯视图状态，不动键集与音域） */
-  const semitoneMode = project.settings.semitoneModeEnabled;
-  const setSemitoneMode = useStore((s) => s.setSemitoneMode);
 
   // ---------------------------------------------------------------- 编辑动作
   //
@@ -464,10 +473,10 @@ export default function StagePage() {
         title="演奏台"
         meta={
           playHasAnySound
-         ? prewarmReady
+            ? prewarmReady
               ? `${selectedTake ? `${selectedTake.name} · ` : ''}音色已就绪`
               : '音色预热中…'
-            : '每个键都是一台序列状态机'
+            : undefined
         }
         status={
           playHasAnySound ? (
@@ -507,8 +516,18 @@ export default function StagePage() {
         </HeaderButton>
       </PageBar>
 
-      {/* ═══ 内容区：铺满剩余高度（不再 max-w-5xl 居中） ═══ */}
-      <div className="min-h-0 flex-1 overflow-y-auto px-3 pb-8 pt-3">
+      {/* ═══ 内容区：铺满剩余高度（不再 max-w-5xl 居中） ═══
+          `flex flex-col` 是**演奏模式的键区能自适应高度的前提**：键区是一个
+          `flex-1` 项，它靠这里的可用高度决定每排多高（见 PlayModeView 的键区注释）。
+          编辑模式那条分支是普通块，作为列向 flex 项同样能正常撑开。 */}
+      <div
+        className={`flex min-h-0 flex-1 flex-col overflow-y-auto px-3 pt-3 ${
+          /* 演奏模式底部留白收到 12px：那 32px 在手机横屏里正好是「第 4 排能不能
+             塞进一屏」的分水岭 —— 键区已经按 64px 触控下限缩过了，别让纯留白把它顶出去。
+             编辑模式是普通文档流，保留原来的呼吸感。 */
+          mode === 'play' ? 'pb-3' : 'pb-8'
+        }`}
+      >
         {/* ------------------------------------------------------ 演奏模式 */}
         {mode === 'play' && (
           <PlayModeView
@@ -533,6 +552,7 @@ export default function StagePage() {
             /* 声部 */
             voiceMode={voiceMode}
             onVoiceModeChange={setVoiceMode}
+            onOpenSynth={() => setSynthOpen(true)}
             onSemitoneChange={setSemitoneMode}
             /* Take 选择器 */
             takes={project.takes}
@@ -579,8 +599,7 @@ export default function StagePage() {
       </div>
 
       {/* ------------------------------------------------------ 编辑弹层 */}
-      {editor && editorKey && (
-        <SlotEditorModal
+      {editor && editorKey && (        <SlotEditorModal
           editor={editor}
           editorKey={editorKey}
           samples={project.samples}
@@ -590,6 +609,10 @@ export default function StagePage() {
           onSwitchToPicking={() => setEditor({ ...editor, picking: true })}
         />
       )}
+
+      {/* ------------------------------------------------------ 音色设计弹层 */}
+      {/* 与「电子音」声部配套：采样声部不经过合成器，所以入口也只在那边出现 */}
+      <SynthPanel open={synthOpen} onClose={() => setSynthOpen(false)} />
 
       {/* ------------------------------------------------------ 拖拽覆盖层 */}
       {dragOver && <div className="stage-drop-overlay">松开以载入乐器</div>}

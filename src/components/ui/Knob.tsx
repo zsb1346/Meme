@@ -23,6 +23,16 @@
  *   - **双击复位**到 `def`（旧版没有）
  *   - **滚轮微调**（乘性，符合「越靠近目标越精细」的感知；Shift 更细）
  *
+ * 手感曲线（`curve`，默认 `linear`，对既有面板零影响）：
+ *   - `log` 让**归一化行程**按对数分布，用于跨数量级参数（截止频率 40→18k、
+ *     起音 1ms→4s）。线性映射下这类旋钮 90% 的行程挤在听不出差别的一端，
+ *     是「拧半天没反应」的固定来源。开 log 后拖动/滚轮/方向键**全部走归一化
+ *     空间**（方向键 1%、PageUp 10%），步进仍按 `step` 在数值空间量化。
+ *   - `min <= 0` 时自动降级为线性（对数需要正数，宁可不 log 也不出 NaN）。
+ *
+ * 读数（`formatText` / `unitText`）：`unit` 那套枚举覆盖不了 cents / bit / 声像
+ * 这类读数，面板可自行注入文案；不注入时行为与旧版完全一致。
+ *
  * 纯受控组件：拖动只经 onChange 上抛，不持有自身数值状态。
  */
 import { useId, useRef } from 'react';
@@ -36,6 +46,9 @@ export type KnobUnit =
   | 'hz'
   | 'deg'
   | 'raw';
+
+/** 手感曲线：`linear`（默认）或按数量级分布的 `log` */
+export type KnobCurve = 'linear' | 'log';
 
 export interface KnobProps {
   /** 旋钮下方的参数名 */
@@ -56,6 +69,12 @@ export interface KnobProps {
   def?: number;
   /** 拖动中的实时回调（供可视化联动，避免每帧走 store） */
   onDragValue?(value: number): void;
+  /** 手感曲线；缺省 linear */
+  curve?: KnobCurve;
+  /** 自定义读数文案（覆盖 unit 派生的文案，单位小字仍按 unitText/unit 走） */
+  formatText?(value: number): string;
+  /** 自定义单位小字（覆盖 UNIT_TEXT） */
+  unitText?: string;
 }
 
 /** 纵向拖动全量程对应的像素距离 */
@@ -142,11 +161,14 @@ export function Knob({
   accent,
   def,
   onDragValue,
+  curve = 'linear',
+  formatText,
+  unitText: unitTextOverride,
 }: KnobProps) {
   const dragRef = useRef<{
     pointerId: number;
     startY: number;
-    startValue: number;
+    startNorm: number;
     moved: boolean;
   } | null>(null);
 
@@ -154,7 +176,28 @@ export function Knob({
   const bodyId = `knob-body-${uid}`;
 
   const range = max - min;
-  const t = range > 0 ? Math.min(1, Math.max(0, (value - min) / range)) : 0;
+  /**
+   * 是否真的走对数：min 必须 > 0 且 max > min，否则**降级为线性** ——
+   * 手感退化可以接受，算出 NaN 把旋钮锁死不行。
+   */
+  const useLog = curve === 'log' && min > 0 && max > min;
+  const logSpan = useLog ? Math.log(max / min) : 1;
+
+  /** 数值 → 归一化 0..1。弧长与全部手势都在这个空间里，log 才可能成立。 */
+  const toNorm = (v: number): number => {
+    if (useLog) {
+      const c = Math.min(max, Math.max(min, v));
+      return Math.min(1, Math.max(0, Math.log(c / min) / logSpan));
+    }
+    return range > 0 ? Math.min(1, Math.max(0, (v - min) / range)) : 0;
+  };
+  /** 归一化 0..1 → 数值 */
+  const fromNorm = (n: number): number => {
+    const nn = Math.min(1, Math.max(0, n));
+    return useLog ? min * Math.pow(max / min, nn) : min + range * nn;
+  };
+
+  const t = toNorm(value);
   const angle = -SWEEP_HALF_DEG + t * SWEEP_HALF_DEG * 2;
   const accentColor = accent ?? 'rgb(var(--flame-400))';
 
@@ -173,7 +216,7 @@ export function Knob({
     dragRef.current = {
       pointerId: ev.pointerId,
       startY: ev.clientY,
-      startValue: value,
+      startNorm: toNorm(value),
       moved: false,
     };
   };
@@ -185,8 +228,13 @@ export function Knob({
     const dy = drag.startY - ev.clientY;
     if (!drag.moved && Math.abs(dy) < 2) return;
     drag.moved = true;
-    const raw = drag.startValue + (dy / DRAG_RANGE_PX) * range;
-    const snapped = quantize(raw, step, min, max);
+    // 手势在归一化空间里走：log 曲线下每像素改变的「比例」才恒定
+    const snapped = quantize(
+      fromNorm(drag.startNorm + dy / DRAG_RANGE_PX),
+      step,
+      min,
+      max,
+    );
     onDragValue?.(snapped);
     if (snapped !== value) onChange(snapped);
   };
@@ -203,24 +251,26 @@ export function Knob({
   const onKeyDown = (ev: React.KeyboardEvent<HTMLDivElement>) => {
     if (disabled) return;
     const big = step * 10;
+    /** log 曲线下方向键按「归一化行程」走（1%），线性下按 step 走 */
+    const nudge = 0.01;
     switch (ev.key) {
       case 'ArrowUp':
       case 'ArrowRight':
         ev.preventDefault();
-        commit(value + step);
+        commit(useLog ? fromNorm(t + nudge) : value + step);
         break;
       case 'ArrowDown':
       case 'ArrowLeft':
         ev.preventDefault();
-        commit(value - step);
+        commit(useLog ? fromNorm(t - nudge) : value - step);
         break;
       case 'PageUp':
         ev.preventDefault();
-        commit(value + big);
+        commit(useLog ? fromNorm(t + nudge * 10) : value + big);
         break;
       case 'PageDown':
         ev.preventDefault();
-        commit(value - big);
+        commit(useLog ? fromNorm(t - nudge * 10) : value - big);
         break;
       case 'Home':
         ev.preventDefault();
@@ -233,16 +283,16 @@ export function Knob({
     }
   };
 
-  /** 滚轮微调：默认每次 1% 量程，Shift 降到 0.1% */
+  /** 滚轮微调：默认每次 1% 行程，Shift 降到 0.1% */
   const onWheel = (ev: React.WheelEvent<HTMLDivElement>) => {
     if (disabled) return;
     const dir = ev.deltaY > 0 ? -1 : 1;
     const fine = ev.shiftKey ? 0.1 : 1;
-    commit(value + dir * (range / 100) * fine);
+    commit(fromNorm(t + dir * 0.01 * fine));
   };
 
-  const valueText = formatKnobValue(unit, value);
-  const unitText = UNIT_TEXT[unit];
+  const valueText = formatText ? formatText(value) : formatKnobValue(unit, value);
+  const unitText = unitTextOverride ?? UNIT_TEXT[unit];
   const endPoint = polarPoint(50, 50, 36, angle);
 
   return (

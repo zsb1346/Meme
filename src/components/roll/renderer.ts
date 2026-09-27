@@ -96,6 +96,13 @@ export interface RenderState {
    * 一眼看出「这排键存在、只是现在按不了」。
    */
   blackLanesDisabled?: boolean;
+  /**
+   * 此刻**正被按住**的键道行（电脑键盘弹奏 / 点击左侧钢琴栏）。
+   *
+   * 与 `editingLane` 的区别：那个是「我在编辑这一行」，持久、安静；
+   * 这个是「这一下我按着」，瞬时、响亮。两者同时存在时后者覆盖前者。
+   */
+  pressedLanes?: ReadonlySet<number>;
   colors: ThemeTokens;
   /** 橡皮筋选框；null 不绘制 */
   marquee: MarqueeRect | null;
@@ -149,6 +156,10 @@ export function draw(ctx: CanvasRenderingContext2D, state: RenderState): void {
     const black = isBlackPitch(pitch);
     const pc = ((pitch % 12) + 12) % 12;
     const isC = pc === 0;
+    /** 此刻被按住（电脑键盘弹奏 / 点击左侧钢琴栏） */
+    const pressed = state.pressedLanes?.has(r) === true;
+    /** 黑键且半音键已收起 → 这一格存在但现在按不了 */
+    const disabledBlack = black && state.blackLanesDisabled === true;
 
     /* ── 时间线区：两级对比底色（用户反馈：对比度太低看不出行）──
        白键行（唱名行）用「浮起面」色，黑键行用「页面底」色。
@@ -161,34 +172,69 @@ export function draw(ctx: CanvasRenderingContext2D, state: RenderState): void {
       ctx.fillStyle = 'rgba(0,0,0,0.35)';
       ctx.fillRect(GUTTER_W, y + l.rowH - 1, l.viewW, 1);
     }
+    // 被按住的整行提亮（瞬时态；画在行带之上、音符块之下，不遮内容）
+    if (pressed) {
+      ctx.fillStyle = withAlpha(c.flame300, 0.13);
+      ctx.fillRect(GUTTER_W, y, l.viewW, l.rowH);
+    }
 
-    // ── 钢琴键盘栏 ──
-    // 黑键：压暗 + 内缩（右缘留出白键可见 1/3），模拟真钢琴的短黑键
+    /* ═══════════════════════════ 钢琴键盘栏 ═══════════════════════════
+       每一行都先铺**琴键面**，黑键行也不例外 —— 真钢琴上黑键背后的位置
+       是相邻白键的延续，黑键只是压在键缝上的一截短键。
+
+       ⛔ 曾把黑键行整格留成页面底色（= 在左栏挖了个洞），于是左栏成了
+       「灰条 + 黑洞 + 一个悬浮蓝框」的斑马纹，完全不像一排琴键
+       （用户实报「左边的钢琴设计的有点丑，很割裂」）。
+       判据：**任何一行的左栏都必须有一条连续的面**，洞就是 bug。 */
+    const capTop = y + 1;
+    const capH = Math.max(1, l.rowH - 2);
+    ctx.fillStyle = isC ? c.ink700 : c.ink800;
+    ctx.fillRect(0, y, GUTTER_W, l.rowH);
+    // 键帽顶部高光 + 底部键缝（整条栏共用的立体语言）
+    ctx.fillStyle = 'rgba(255,255,255,0.07)';
+    ctx.fillRect(0, y, GUTTER_W, 1);
+    ctx.fillStyle = 'rgba(0,0,0,0.55)';
+    ctx.fillRect(0, y + l.rowH - 1, GUTTER_W, 1);
+
+    // 白键被按住：整个键帽点亮
+    if (pressed && !black) {
+      ctx.fillStyle = withAlpha(c.flame400, 0.5);
+      ctx.fillRect(0, capTop, GUTTER_W, capH);
+    }
+
     if (black) {
-      const bw = GUTTER_W * 0.6;
-      if (state.blackLanesDisabled) {
-        /* 半音键已收起：黑键画成**空心轮廓** —— 「位置在、现在是关着的」。
-           行带底色不再加深（音符块还要在这行上清楚可读）。 */
-        ctx.strokeStyle = withAlpha(c.flame400, 0.45);
+      // 短键：右侧留出琴键面，比例接近真钢琴的黑键宽度
+      const bw = Math.round(GUTTER_W * 0.58);
+      if (disabledBlack) {
+        /* 半音键已收起：「位置在、现在按不了」。
+           画成**凹槽**（压暗 + 强调色细描边）而不是空心底上的悬浮框 ——
+           底色现在有琴键面了，凹槽读起来才是「关着的键」。 */
+        ctx.fillStyle = 'rgba(0,0,0,0.45)';
+        ctx.fillRect(0, capTop, bw, capH);
+        ctx.strokeStyle = withAlpha(c.flame400, 0.42);
         ctx.lineWidth = 1;
-        ctx.strokeRect(0.5, y + 0.5, bw - 1, Math.max(1, l.rowH - 1));
+        ctx.strokeRect(0.5, capTop + 0.5, bw - 1, Math.max(1, capH - 1));
       } else {
         ctx.fillStyle = c.ink950;
-        ctx.fillRect(0, y, bw, l.rowH);
+        ctx.fillRect(0, capTop, bw, capH);
+        // 右缘高光 = 键的侧面：让它看起来是「压在琴键面上的方块」而不是缺口
+        ctx.fillStyle = 'rgba(255,255,255,0.16)';
+        ctx.fillRect(bw - 1, capTop, 1, capH);
+        // 底缘投影
         ctx.fillStyle = 'rgba(0,0,0,0.7)';
-        ctx.fillRect(0, y, bw, 1);
-        ctx.fillRect(bw - 1, y, 1, l.rowH);
+        ctx.fillRect(0, capTop + capH - 1, bw, 1);
+        // 黑键被按住：只在黑键自己的宽度内点亮，保住黑白键的形状差异
+        if (pressed) {
+          ctx.fillStyle = withAlpha(c.flame400, 0.62);
+          ctx.fillRect(0, capTop, bw, capH);
+        }
       }
-    } else {
-      ctx.fillStyle = c.ink800;
-      ctx.fillRect(0, y, GUTTER_W, l.rowH);
-      // 白键顶部 1px 内高光（与面板同一套立体语言）
-      ctx.fillStyle = 'rgba(255,255,255,0.07)';
-      ctx.fillRect(0, y, GUTTER_W, 1);
-      // 白键之间的缝隙
-      ctx.fillStyle = 'rgba(0,0,0,0.6)';
-      ctx.fillRect(0, y + l.rowH - 1, GUTTER_W, 1);
     }
+
+    /* 键盘栏右缘分界。不画这条线时，白键面（ink800）与白键行带（laneKey）
+       直接相接，两片灰糊成一片 —— 这是「割裂」的另一半来源。 */
+    ctx.fillStyle = 'rgba(0,0,0,0.85)';
+    ctx.fillRect(GUTTER_W - 1, y, 1, l.rowH);
 
     /* 装配编辑中的键道：整行铺一层淡强调色 + 左缘亮条。
        画在行带之后、主音标记之前，保证 C 行的强调条仍然可见。 */

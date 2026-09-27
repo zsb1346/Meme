@@ -131,6 +131,59 @@
 **通用教训**：凡是「等 A 就绪 → 断言 B 也就绪」，先问 **A 与 B 是不是同一段 await 里设的**。
 不是的话，就必须一起等，否则断言时红时绿，且红得毫无信息量。
 
+### 5.3 ⛔ 注入状态前先钉住「模块 URL 的 `?t=`」——否则写进影子 store（2026-09-27 加）
+
+**症状**：`roll-verify.mjs` 报 `找不到卷帘 canvas`。看着像「卷帘挂了」。
+实测却是：探针 `import('/src/model/store.ts')` 后 `getState().takes` **明明有注入的 take**，
+页面却显示空状态（`录骨架 · 卷帘修` + `钢琴卷帘还空着`）；`document.body.innerText`
+里**从头到尾没出现过**那个 take 的名字。
+
+**真因**：Vite 在 HMR / 依赖重优化之后会给模块 URL 挂 `?t=<时间戳>` 做缓存击穿，
+而**带查询串与不带查询串是两个不同的模块实例**：
+
+| | URL |
+|---|---|
+| App 用的 | `…/src/model/store.ts?t=1790476600152` |
+| 探针 import 的 | `…/src/model/store.ts` |
+
+两者各自 `create()` 一个 zustand store。探针 `setState` 写进**影子 store**，
+页面一无所知 → 所有注入失效 → 断言全红。**而探针自己读回来还全是「对」的**，
+所以它连报错都指不到真因。
+
+**为什么特别恶**：它**只在「dev server 已经跑过一轮 HMR / 重优化」时出现**。
+冷启动的服务器上模块 URL 没有 `?t=`，裸路径恰好就是 App 用的那个 → 探针一路绿灯。
+**即探针的可信度取决于服务器的新鲜度，而这件事没人会记得**；
+`roll-verify.mjs` 之前「18/18 绿」就是这么来的。
+
+**修法**（`scripts/_app-import.mjs`，两个卷帘探针共用）：
+
+```js
+window.__appImport = async (path) => {
+  const hits = performance.getEntriesByType('resource').filter((e) => {
+    const u = new URL(e.name);
+    return u.origin === location.origin && u.pathname === path;
+  });
+  if (hits.length === 0) throw new Error('找不到 App 请求过的模块 URL：' + path);
+  return import(hits[hits.length - 1].name);   // 取最后一次请求 = 当前模块图里那个
+};
+```
+
+⛔ **找不到就抛，不许退回裸路径** —— 退回等于又去写影子 store，把「静默假红」原样搬回来。
+宁可探针炸得响亮，也不要它绿得可疑。
+
+**⭐ 并且加一条「守卫的守卫」**：`storeIdentityCheckSource()` 用 store **自己的 action**
+（`setKeyCount`）改一个数，看侧栏那行 `N 键 · M 素材` 有没有跟着变。
+侧栏**所有页面都在**（不像制作台的 take 下拉框只在录制 tab 里），所以这条不挑页面、
+不挑 tab；用 action 而不是自己拼对象 → 不依赖 `Key` 的形状，store 改 schema 也不会假红。
+两个探针都在注入任何状态**之前**先跑它，不过就当场抛。
+
+**通用教训**：**凡是「探针 import 应用模块再改它的状态」，先证明拿到的是同一个实例。**
+ES 模块的身份由**完整 URL**（含查询串）决定，不是由路径决定。
+
+- 只影响**往运行中的 App 注入状态**的探针（`roll-verify` / `probe-roll-keys` / `diag-*`）。
+- `probe-synth*.mjs` **不受影响**：它们 import 引擎只是为了自建 `OfflineAudioContext`
+  离线渲染，不往页面注入状态 —— 拿到副本反而更干净。
+
 ## 6. 试听时序：怎么测、契约是什么（2026-09-20 加）
 
 ### 6.1 判据与量法（`_probe-palette.mjs` 第 15 节）
@@ -220,3 +273,181 @@ spawns=0  status=ready  kind=undefined
   因为「主线程同步跑」的耗时决定「worker 掉了之后卡不卡」，属于只能实测的量。
 - `__detectPitch(id, detector)` 会**先清缓存**再检测。不清的话测的是缓存、不是路径
   （「指标测不到」的典型来源）。
+
+## 8. 截图 / CDP 探针操作守则（从 `MEMORY.md §G` 迁入）
+
+- **⭐ 改完 UI 必须自己截图看一眼**（`node scripts/cdp-shot.mjs <url> outputs/ui-review/x.png`）。
+  **纯模型层重构对用户不可见** —— 用户为此明确不满过（「看不到变化，积分先少了1200」）。
+- **⛔⛔ 验收手机端必须带 `--mobile`**：`--w=390 --h=844` 是 `--window-size`，
+  而 **Windows 上 Chrome 最小窗口宽度实测 491px** → 你以为在测 390 宽手机竖屏，
+  实际是 **491×692 的横屏小窗，布局判断全错**（2026-09-25 栽过一次，7 张图全废）。
+  `--mobile` 走 `Emulation.setDeviceMetricsOverride` + `setTouchEmulationEnabled`，
+  **必须在 `Page.navigate` 之前下发**（否则首帧仍按窗口宽度布局）。
+  **自检**：`--eval` 回读 `window.innerWidth`，别靠眼睛猜。
+- **⛔ 同一条 `--eval` 里连点多个控件只会生效最后一个**（React 18 批处理 setState，闭包是旧值：
+  `for(i<8)click()` 实测只 +1）。**拆多条 eval**，或 `async` + 每击后 `await sleep(70~90ms)`。
+  **点导航与点页内控件也必须分开。**
+  ⭐ 但 `cdp-shot.mjs` 的 `--click=` **本身已经是分步的**（每击后固定 `sleep(320)`）→
+  「点导航 → 点页内控件 → 再点第二个」可以放心连写多条 `--click=`，不必拆进程。
+  `--eval` 在**所有 `--click` 之后**跑，且 `awaitPromise: true`、返回值原样回显到 stdout
+  → **优先用 `--eval` 读 DOM/状态来断言，比截图快也比截图准。**
+- **⛔ 探针坑：`[data-key-index]` 的 DOM 顺序 ≠ 键序**。`PianoLayout` 是按「白键组 +
+  绝对定位的黑键组」铺的，直接 `querySelectorAll` 读到的是 `C3 D3 E3 … B3 C#3 D#3 …`
+  （7 白 + 5 黑）→ **会把一个完全正确的键盘误判成「顺序全乱」**。必须按 `data-key-index`
+  排序后再读。
+- **⛔ `--eval` 里 `import('/src/model/store.ts')` 常常不是应用那份模块实例**（HMR 后带 `?t=`）
+  → 写 store 白写（现象：store 里明明有 take、UI 还是空态）。**别因这种假象改业务代码。**
+  **2026-09-27 起有确定性解法**（不是绕路）：用 `scripts/_app-import.mjs` 的
+  `APP_IMPORT_BOOTSTRAP` → `window.__appImport(path)`，它按 `performance` 里 App 真正
+  请求过的那条 URL（**取最后一次**）去 import，拿到的一定是同一个实例；
+  并用 `storeIdentityCheckSource()` 当场验证。**完整成因与守则见 §5.3**。
+  旧绕法（仅在不能改脚本时用）：造数据走 IndexedDB + 刷新 ——
+  `indexedDB.open('meme-studio',1)` → `meta` 库 `put(project,'project')` → `location.reload()`。
+  传长脚本用 `--eval="$(cat /tmp/x.js)"`。
+- **⛔ 本地 dev server 会被后台任务生命周期带走**（整页 `ERR_CONNECTION_REFUSED`、动态 import 全失败）
+  → **它可消耗，不代表代码坏了**；重启 `npx vite --port 5173 --strictPort`。
+- **⛔ 注入 store 数据必须等 `hydrated` 为 true**（2026-09-26）。`App` 的 `hydrate()` 是异步的，
+  它 `set({ project: p })` 会**整个覆盖**你刚注入的 take —— 现象是「注入返回成功、页面上什么都没有」，
+  极像「注入没生效」。`--wait=1800` 太短（实测要 3.5s 起）；**稳妥做法是在页面里轮询
+  `S.getState().hydrated`（最多 6~12s），false 就直接返回诊断而不是硬着头皮继续。**
+- **⛔ 改过源码之后（HMR），`import('/src/model/store.ts')` 会拿到另一份模块实例**：
+  模块图里带 `?t=<时间戳>`，于是你这份 store `hydrated` **永远是 false**、`setState` 也写不进应用
+  （现象：导航按钮点得动、数据死活不出现）。**最快的解法是重启 dev server**（拿干净模块图），
+  比重建 IndexedDB + `location.reload()` 那套省事；`roll-verify.mjs` 之所以没踩到，
+  是因为它每次都是**新起的 server + 新页面**。
+- **⛔ 读 canvas 上的调试快照（`__rollView` / `__rollKeys`）必须等下一帧**：它们由渲染循环在
+  `draw()` 里写，而渲染循环**只在 `dirty` / 拖拽 / 播放时**才跑。派发完事件**立刻**读 = 读到
+  **上一帧**，于是「按了 X 基准没动」这种结论可能是假的（探针第一版就被自己骗了两轮）。
+  正确姿势：`await` 3~6 个 `requestAnimationFrame` 再读。
+  **推论**：如果某个状态改动**刻意不重绘**，它在快照里就永远看不见 —— 要么重绘，要么别用它断言。
+- **⛔ 探针要留截图时，被观察的状态必须「按住不放」**：截图发生在脚本返回**之后**，
+  脚本里松了手就只会拍到一张干净图。
+- **⛔ 探针不要自己从「键数」算行高**：用 canvas 上挂的 `__rollView.rowH` / `sy`。
+  自己算过一回（61 键域按 24 键算），点到了第 31 行，却看着像「左栏点击落错行」。
+- **⛔ 断言「状态变了」之前，先断言「点击真的落在元素矩形内」**（2026-09-26 二次栽）。
+  `roll-verify.mjs §9`（右键删除）硬点 `events[0]`，而前面 §4 的纵向缩放把视图滚走了
+  （实测 `sy=157 / rowH=35.6`）→ 命中点的 `y=84` 落在 canvas 上边界（94）**之外**，
+  **指针事件打进了空气**，删除当然不发生 → 红得像功能坏了，实际是探针在点页面空白。
+  修法：**在页面里先筛出「确实落在 `getBoundingClientRect()` 内」的目标**（按 X/Y 双轴过滤），
+  一个都没有就返回 `NO-VISIBLE-EVENT` 而不是硬点。
+  **推论**：任何「先算坐标再派发指针事件」的探针，都要把坐标回显到断言详情里 ——
+  这次的 `y=84` 一眼就定位了。
+- **⛔ 永远为假的守卫 = 谎言**（2026-09-26）。`roll-verify.mjs §1` 曾写
+  `if (typeof S.getState().setSelectedTakeId === 'function') S.getState().setSelectedTakeId(...)`，
+  看着像「兼容两版 API」，**实际永远为假、静默什么都不做** —— 而**store 上压根没有这个动作**
+  （「选中的是哪个 take」是 `StagePage` / `StudioPage` 各自的私有 `useState`，从 store 够不着；
+  注入到 `takes[0]` 让页面自动落到选中位，才是唯一手段）。
+  靠「`takes[0]` 碰巧自动选中」它还能跑，于是没人发现；直到 §10 真的靠它切 take 时，
+  探针就**跑在别人的 take 上**、5 项断言里有 3 项是空洞绿。
+  **判据：守卫的两个分支都必须可达，否则删掉它、把真实机制写进注释。**
+  **同类气味**：`if (x) { … }` 里 `x` 恒假；`catch` 吞掉的异常；`.filter()` 之后没人看的空数组。
+
+## 9. 卷帘：电脑键盘弹奏 + 左侧钢琴栏（2026-09-26 加）
+
+用户三条诉求（原话）：「在钢琴卷帘的时候是不是能按键盘对应的让其播放？但**只播放合成音、不播放素材**」、
+「按下某个按键，钢琴卷帘的某一列应该高亮一点点便于观察」、「左边的『钢琴』设计的有点丑，很割裂」。
+
+### 9.1 文件分工
+
+| 文件 | 职责 |
+| --- | --- |
+| `src/components/roll/keyboard-play.ts` | **纯映射层**：`KEYBOARD_SEMITONES`（`e.code` → 半音）、`keyboardBasePitch()`、`resolveKeyboardNote()`、`isTypingTarget()`。零 React / 零音频，**有单测** |
+| `src/components/roll/useRollController.ts` | 接线：window 监听、起音/收声、按下集（`pressedRef`）、左栏指针分支 |
+| `src/components/roll/renderer.ts` | 钢琴栏绘制 + `pressedLanes` 高亮 |
+| `src/engine/synth/index.ts` | `releaseSynthNote(midi)`（松手只收一个音） |
+| `scripts/probe-roll-keys.mjs` | 端到端验收（16 项） |
+
+### 9.2 契约（改这块之前先读）
+
+- **只发合成声**：整条链路只调 `playSynthNote` / `releaseSynthNote`。
+  卷帘**从不**触发采样播放 —— 那是播放（`take-player`）与导出（`sample-player`）的职责。
+  **这条约束没有运行时症状**：一旦破坏，用户按一个键同时听到「参考音 + 素材」两响，
+  音量叠起来像「音色变厚」，很容易被当成调得好。所以有结构守卫
+  `src/components/roll/roll-synth-only.test.ts`（读源码断言卷帘一族不许 import
+  `sample-player` / `take-player` / `engine/recorder` / `engine/exporter` / `engine/offline`）。
+- **左右分职**：左栏 = 键盘（点/按住 → 发声试听 + 点亮该行），时间线 = 编辑。
+  左栏分支在**命中测试之前** `return`，**不进**拖拽/框选/插入音符状态机 ——
+  否则在左栏横拖会框选、竖拖会平移，一个想弹琴的人会得到一堆意外选区。
+- **按住延音**：`durationSec = KEYBOARD_HOLD_SEC`（30s），真正的收声靠 `keyup` →
+  `releaseSynthNote`。**`keydown` / `keyup` / `blur` 三件套缺一不可** ——
+  切窗口/切标签页时 `keyup` 收不到，缺 `blur` 就留下挂住的长音。
+- **守卫**：带 `Ctrl/⌘/Alt` 的组合一律放行给编辑快捷键；`Shift` 也整体让位
+  （`Shift+A` 是「打开装配面板」的既有快捷键，同时处理会一次按键既弹一声又弹开面板）；
+  焦点在输入类控件里不拦截（否则搜索框打字会出声、还被吞字符）；有 `[role="dialog"]`
+  的弹层开着时不弹奏。**键盘监听挂 `window`**（用户不必先点一下画布才能弹）。
+- **基准音**：`A` 键 = 基准，基准**始终吸附到键域内的某个 C**。默认键域（24 键 C3–B4）
+  下基准 = **C4**；`Z`/`X` 移八度。
+  **⛔ 夹取区间只能是键域本身 `[lo, hi]`**：若为了「给上行 16 个半音留空间」收窄到
+  `[lo, hi−16]`，默认 C4 会被压到键域下沿，而 `X` 算出的 72 又被同一个夹取压回 60 →
+  **按 X 毫无反应**。窄键域里 X 到顶是**安静的空操作**（这是设计行为）。
+  **⛔ ref 里必须存「已生效的值」而不是「想要的值」**：否则窄键域里按 X 看似没反应，
+  之后用户一加宽键域，音区自己跳一个八度 —— 他没按任何键。
+- **没有死键**：`resolveKeyboardNote` 先按音高**精确**匹配，匹配不到就落到**最接近的键**
+  （同分取低音）。自然音模式（无黑键行）下 `W/E/T/Y/U` 仍有落点 ——
+  若改成「不存在就不发声」，用户只会得到「按了没反应」。
+- **⛔ `Z`/`X` 分支必须无条件标脏**：它不改任何行、不起声源，极易漏；漏了画面停在上一帧
+  （平时看不出来，一旦有东西依赖重绘就错）。
+
+### 9.3 左侧钢琴栏的画法（用户：「很割裂」）
+
+**根因**：黑键行整格被留成**页面底色**（`ink950`），而背景也是 `ink950` →
+**视觉上等于在左栏挖了个洞**；连那圈「黑键描边」也是黑底黑线，根本看不见。
+结果整条栏是「灰条（白键行）+ 黑洞（黑键行）+ 一个悬浮蓝框」的斑马纹。
+
+**正确画法**：**每一行都先铺「琴键面」**（`ink800`，C 行用 `ink700`），黑键行也不例外 ——
+真钢琴上黑键背后的位置本来就是相邻白键的延续，黑键只是**压在键缝上的一截短键**。
+然后再叠黑键方块（宽 `GUTTER_W × 0.58`，右缘 1px 高光当「侧面」、底缘投影），
+最后在 `GUTTER_W − 1` 画 1px 分界，把「键盘」与「时间线」分开
+（不画分界时白键面 `ink800` 与白键行带 `laneKey` 两片灰直接相接，又糊成一片）。
+
+**半音键收起时**（`blackLanesDisabled`）：黑键画成**凹槽**（`rgba(0,0,0,0.45)` 填充 +
+强调色 0.42 细描边）—— 底色有琴键面之后，凹槽读起来才是「关着的键」；
+上一版是在纯黑底上描一个空心框，像悬浮 UI。
+
+**判据（可以当回归用）**：**任何一行的左栏都必须有一条连续的面，洞就是 bug。**
+
+**按下高亮**：白键行整条键帽染 `flame400 @ 0.5`；黑键行只在**黑键自己的宽度内**点亮
+（保住黑白键的形状差异）；时间线区叠一层 `flame300 @ 0.13`。
+`pressedLanes` 传的是 **`Set` 本身**（`Set.has` 是 O(1)，不必每帧转数组）。
+与 `editingLane`（「我在编辑这一行」，持久、0.14）语义不同、刻意分色强度。
+
+### 9.4 验收（`node scripts/probe-roll-keys.mjs 5173`）
+
+16 项：卷帘可见 / 初始无挂音 / 基准是域内的 C / `A` → 点亮基准行 / 三键和弦点亮三行且互不相同 /
+松一键只熄一行 / 宽键域 `X` 真的 +12 / `Z` 回原位 / **窄键域 `X` 是安静空操作且处理函数确实跑了** /
+输入焦点不弹奏 / `Ctrl+A` 放行 / 失焦收声全灭 / **点左栏点亮对应行** / 左栏松手熄灯 /
+**点左栏不插入音符** / 全程无异常。
+
+**快照**：canvas 上挂 `__rollKeys = { pressed, base, shifts, held }`。
+`shifts` 是 `Z`/`X` 处理函数执行次数的计数 ——
+「按了 X 没反应」有两种成因（**没进处理函数** vs **进了被键域边界夹住**），
+两者在画面上完全一样，只有计数能分开。
+
+### 9.5 左右键切换音符 → 目标在视口外时自动横向聚焦（2026-09-26 加）
+
+用户原话：「我们不要按左右按键切换音符吗? 那这样 **超出显示区域的 就是 按左键右键的时候
+能自己聚焦一下**」。
+
+**为什么必须做**：`←`/`→` 是**按时间顺序**切换音符（`navigateSelection`，按 `tSec` 排序），
+目标极可能落在当前时间段之外；只做纵向 `revealLane` 时表现为
+**「选中变了、画面就是不动」—— 跟按键失灵长得一模一样**。
+
+**实现**：`src/components/roll/geometry.ts::revealBlockX(view, tSec, durationSec, l)`，
+与 `revealLane` 并列的横向版本，纯函数（可单测）：
+
+- **完整可见 → 原样返回同一个对象**（调用方靠 `!==` 判断「动没动」）；否则必出新对象。
+- **⭐ 触发条件不含边距，落地位置才留边距**：判「可见」用视口本身（`x >= GUTTER_W && x + bw <= l.w`），
+  而滚到位时让块缘离边 `REVEAL_MARGIN_PX`。**判据若也带上边距，音符还在屏幕上视图就自己动。**
+- **块比可视区还宽 → 左缘对齐**（保证看得见音头），不试图把整块塞进来。
+- **到边界 `clampViewState` 收敛，绝不越界**；视口窄到 `viewW - 2*margin <= 0` 时直接不动。
+- **⛔ 只动 `sx`，不许顺手改 `sy`**（纵向是 `revealLane` 的职责）。
+  单测里为这条专门要造「纵向确实有余量」的视图（`rowH=40`）—— 否则 `clampViewState`
+  会把 `sy` 顺手夹成 0，测的就成了「我构造的视图本来就不合法」。
+
+**接线**（`useRollController.ts::navigateSelection`）：纵向 `revealLane` 包在横向 `revealBlockX`
+外面一层，**两个偏移都写回 `viewRef` 并 `dirtyRef = true`**。
+
+**验收**：单测 `src/components/roll/reveal-block-x.test.ts`（8 项，纯数学）＋
+端到端 `scripts/roll-verify.mjs` §10（5 项，验接线 —— `__rollView.sx` 到底变没变）。
+§10 的素材是**原地改造 `takes[0]`**（两个音符拉开 17.6s），不新塞 take（见 §8 的「永远为假的守卫」）；
+并有一项**前置断言「目标不完整可见」**，否则「滚没滚」根本无从判断、五项里三项空洞绿。

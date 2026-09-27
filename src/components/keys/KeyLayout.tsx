@@ -50,10 +50,33 @@ export interface KeyLayoutProps {
    * 「按下标顺序填格」的网格，C#3 变成白键格子、顶掉 D3 的位置。
    */
   hideBlackKeys?: boolean;
+  /**
+   * 让每一排**吃满容器高度**（演奏台手机端「缩小塞进一屏」用）。
+   *
+   * `false`（默认）= 每排固定 96px：桌面演奏台与制作台照旧，一行不动。
+   * `true` = 每排 `flex-1`，实际高度由**调用方给容器的高度**决定 ——
+   * 所以调用方必须同时给出高度区间，判据就是下面导出的两个常量：
+   *   `minHeight = 排数 × KEY_ROW_MIN_H + 间隙`（给不到就让外层滚动）
+   *   `maxHeight = 排数 × KEY_ROW_MAX_H + 间隙`（给多了就留白，别把键拉成方块）
+   * ⛔ 只给 `fill` 不给高度 = 每排高度 0（`flex-1` 无参照），整片键盘消失。
+   */
+  fill?: boolean;
 }
 
 const COLS = 7; // 一个八度 = 7 个白键
 const GAP_PX = 8; // 与 gap-2 一致
+
+/**
+ * 一排的高度区间。
+ *
+ * `MAX` = 桌面上的现状（96px）；`MIN` = **触控安全线 64px** ——
+ * 手机端「缩小塞进一屏」只能缩到这个下限，再矮就会误触相邻键
+ * （见 `原型/手机端设计.md`：琴键最小高度 64）。
+ */
+export const KEY_ROW_MAX_H = 96;
+export const KEY_ROW_MIN_H = 64;
+/** 排间间隙（= GAP_PX，导出给调用方算容器高度用） */
+export const KEY_ROW_GAP = GAP_PX;
 
 /** 黑键音级 → 它落在「第几条白键缝」（C#→1, D#→2, F#→4, G#→5, A#→6） */
 const BLACK_BOUNDARY: Record<number, number> = {
@@ -97,11 +120,75 @@ function arcRotationDeg(pos: number, rowLen: number, maxDeg: number): number {
   return -t * maxDeg;
 }
 
+/** 一个八度（一排）的分组结果 */
+export interface OctaveGroup {
+  /** 列位（0..6）→ 键下标；空列留洞，保证跨八度纵向对齐 */
+  whiteByCol: Map<number, number>;
+  blacks: Array<{ i: number; boundary: number }>;
+}
+
+/**
+ * 按八度分组 —— **全项目唯一**的分组实现。
+ *
+ * ⛔ 排数在两处都要用：这里决定画几排，调用方还要拿它算容器高度
+ * （`minHeight / maxHeight`）。**各算一遍必然迟早不一致** ——
+ * 表现是「按 4 排算的高度配 3 排的画面」，末排被拉长或底下留一条空带。
+ * 所以只有这一个函数，`octaveRowCount` 也只是数它。
+ */
+export function octaveGroups(
+  keyPitches: readonly number[],
+  keyCount: number,
+  hideBlackKeys: boolean,
+): Array<[number, OctaveGroup]> {
+  const groups = new Map<number, OctaveGroup>();
+  for (let i = 0; i < keyCount; i++) {
+    const pitch = keyPitches[i];
+    if (typeof pitch !== 'number') continue;
+    const group = Math.floor(pitch / 12);
+    const chroma = ((Math.round(pitch) % 12) + 12) % 12;
+    const g: OctaveGroup = groups.get(group) ?? { whiteByCol: new Map(), blacks: [] };
+    if (isBlackMidi(pitch)) {
+      /* 半音键收起：黑键**不摆**。它的键对象还在 store 里（装配、音符都在），
+         只是此刻没有可点的位置 —— 重新打开开关即刻原样回来。 */
+      if (!hideBlackKeys) g.blacks.push({ i, boundary: BLACK_BOUNDARY[chroma] ?? 1 });
+    } else {
+      g.whiteByCol.set(WHITE_COL[chroma] ?? 0, i);
+    }
+    groups.set(group, g);
+  }
+  /*
+    收起黑键后，末尾可能剩下一整个「只有黑键」的八度组（音域正好收在黑键上）。
+    那一行会渲染成 7 个空格子 —— 高 96px 的空白带，看着像布局坏了。整组跳过。
+  */
+  return [...groups.entries()]
+    .filter(([, g]) => !hideBlackKeys || g.whiteByCol.size > 0)
+    .sort((a, b) => a[0] - b[0]);
+}
+
+/** 这台键盘会画几排（= 几个八度组） */
+export function octaveRowCount(
+  keyPitches: readonly number[],
+  keyCount: number,
+  hideBlackKeys: boolean,
+): number {
+  return octaveGroups(keyPitches, keyCount, hideBlackKeys).length;
+}
+
+/** 一排的高度区间 → 整块键区的高度区间（`fill` 模式的调用方直接用） */
+export function keyAreaHeightRange(rows: number): { minH: number; maxH: number } {
+  const gaps = Math.max(0, rows - 1) * KEY_ROW_GAP;
+  return {
+    minH: rows * KEY_ROW_MIN_H + gaps,
+    maxH: rows * KEY_ROW_MAX_H + gaps,
+  };
+}
+
 export default function KeyLayout({
   keyCount,
   renderKey,
   keyPitches,
   hideBlackKeys = false,
+  fill = false,
 }: KeyLayoutProps) {
   if (!keyPitches) return <FallbackGrid keyCount={keyCount} renderKey={renderKey} />;
   return (
@@ -110,6 +197,7 @@ export default function KeyLayout({
       renderKey={renderKey}
       keyPitches={keyPitches}
       hideBlackKeys={hideBlackKeys}
+      fill={fill}
     />
   );
 }
@@ -149,44 +237,27 @@ function PianoLayout({
   renderKey,
   keyPitches = [],
   hideBlackKeys = false,
+  fill = false,
 }: KeyLayoutProps) {
-  interface OctaveGroup {
-    /** 列位（0..6）→ 键下标；空列留洞，保证跨八度纵向对齐 */
-    whiteByCol: Map<number, number>;
-    blacks: Array<{ i: number; boundary: number }>;
-  }
-  const groups = new Map<number, OctaveGroup>();
-  for (let i = 0; i < keyCount; i++) {
-    const pitch = keyPitches[i];
-    if (typeof pitch !== 'number') continue;
-    const group = Math.floor(pitch / 12);
-    const chroma = ((Math.round(pitch) % 12) + 12) % 12;
-    const g: OctaveGroup = groups.get(group) ?? { whiteByCol: new Map(), blacks: [] };
-    if (isBlackMidi(pitch)) {
-      /* 半音键收起：黑键**不摆**。它的键对象还在 store 里（装配、音符都在），
-         只是此刻没有可点的位置 —— 重新打开开关即刻原样回来。 */
-      if (!hideBlackKeys) g.blacks.push({ i, boundary: BLACK_BOUNDARY[chroma] ?? 1 });
-    } else {
-      g.whiteByCol.set(WHITE_COL[chroma] ?? 0, i);
-    }
-    groups.set(group, g);
-  }
-  /*
-    收起黑键后，末尾可能剩下一整个「只有黑键」的八度组（音域正好收在黑键上）。
-    那一行会渲染成 7 个空格子 —— 高 96px 的空白带，看着像布局坏了。整组跳过。
-  */
-  const ordered = [...groups.entries()]
-    .filter(([, g]) => !hideBlackKeys || g.whiteByCol.size > 0)
-    .sort((a, b) => a[0] - b[0]);
+  const ordered = octaveGroups(keyPitches, keyCount, hideBlackKeys);
 
   return (
-    <div className="touch-play-area w-full">
-      <div className="mx-auto flex w-full max-w-[1180px] flex-col" style={{ gap: `${GAP_PX}px` }}>
+    <div className={fill ? 'touch-play-area flex h-full min-h-0 w-full flex-col' : 'touch-play-area w-full'}>
+      <div
+        className={
+          'mx-auto flex w-full min-w-0 max-w-[1180px] flex-col' +
+          (fill ? ' h-full min-h-0 flex-1' : '')
+        }
+        style={{ gap: `${GAP_PX}px` }}
+      >
         {ordered.map(([group, g]) => {
           /* 有黑键的行转平：黑键绝对定位在白键缝上，弧线会让两者错位 */
           const flat = g.blacks.length > 0;
           return (
-            <div key={group} className="relative h-[96px]">
+            <div
+              key={group}
+              className={fill ? 'relative min-h-0 flex-1' : 'relative h-[96px]'}
+            >
               {/*
                 白键铺底：**恒定 7 列**，空列渲染成占位块。
                 「尾组只有 1 个白键就只给 1 列」曾是 bug —— 那个键会被拉满整行宽度，

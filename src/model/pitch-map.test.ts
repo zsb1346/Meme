@@ -5,6 +5,7 @@ import {
   KEY_MAX_MIDI,
   isBlackMidi,
   isDiatonicMidi,
+  isKeyPlayable,
   keyPitch,
   keyPitchAt,
   keyRangePresets,
@@ -112,6 +113,39 @@ describe('黑白键判定', () => {
   it('白键', () => {
     for (const p of [48, 50, 52, 53, 55, 57, 59, 60]) expect(isBlackMidi(p)).toBe(false);
     expect(isDiatonicMidi(60)).toBe(true);
+  });
+});
+
+describe('isKeyPlayable（屏幕上没有的键不许出声）', () => {
+  it('半音键收起 → 黑键不可弹、白键照旧可弹', () => {
+    for (const p of [49, 51, 54, 56, 58, 61]) {
+      expect(isKeyPlayable(p, true)).toBe(true);
+      expect(isKeyPlayable(p, false)).toBe(false);
+    }
+    for (const p of [48, 50, 52, 53, 55, 57, 59, 60]) {
+      expect(isKeyPlayable(p, true)).toBe(true);
+      expect(isKeyPlayable(p, false)).toBe(true);
+    }
+  });
+
+  it('半音键开启 → 什么都不拦', () => {
+    for (let p = KEY_BASE_MIDI; p <= KEY_MAX_MIDI; p++) {
+      expect(isKeyPlayable(p, true)).toBe(true);
+    }
+  });
+
+  it('⛔ 下标不存在（音高 undefined / NaN）→ 一律不可弹', () => {
+    expect(isKeyPlayable(undefined, true)).toBe(false);
+    expect(isKeyPlayable(undefined, false)).toBe(false);
+    expect(isKeyPlayable(NaN, true)).toBe(false);
+  });
+
+  it('⭐ 判据与「上屏」同源：可弹的键恰好就是可见的键', () => {
+    const pitches = Array.from({ length: 24 }, (_, i) => KEY_BASE_MIDI + i);
+    for (const semi of [true, false]) {
+      const playable = pitches.filter((p) => isKeyPlayable(p, semi));
+      expect(playable).toHaveLength(visibleKeyCount(pitches, semi));
+    }
   });
 });
 

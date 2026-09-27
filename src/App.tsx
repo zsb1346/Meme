@@ -195,16 +195,16 @@ export default function App() {
           className="absolute inset-y-0 left-0 flex w-14 flex-col overflow-hidden border-r border-line bg-ink-900
                      transition-[width] duration-200 ease-out group-hover:w-[200px] group-hover:shadow-[0_0_0_1px_rgb(var(--line)),12px_0_32px_-8px_rgb(0_0_0/0.7)]"
         >
-          {/* 品牌 */}
+          {/* 品牌 —— 名字与 index.html 的 <title> 必须一致，不要出现第二个品牌名 */}
           <button
             type="button"
             onClick={() => setActivePage('material')}
-            title="哈吉米 Meme Instrument"
+            title="Meme Studio"
             className="flex h-[52px] shrink-0 items-center gap-2.5 pl-[17px] pr-4 text-left transition-colors hover:bg-ink-800"
           >
             <IconBrand size={21} className="shrink-0 text-flame-400" />
             <span className="whitespace-nowrap text-body font-semibold tracking-[-0.01em] text-label-hi opacity-0 transition-opacity duration-150 group-hover:opacity-100">
-              哈吉米
+              Meme Studio
             </span>
           </button>
 

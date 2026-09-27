@@ -31,10 +31,10 @@ import {
   visibleKeyCount,
   visibleKeysInSpan,
 } from '../../model/pitch-map';
-import KeyLayout from '../keys/KeyLayout';
+import KeyLayout, { keyAreaHeightRange, octaveRowCount } from '../keys/KeyLayout';
 import MemeKey, { type MemeKeyPressResult } from '../keys/MemeKey';
 import { Seg, Led } from '../ui/PageBar';
-import { IconKeyboard, IconMinus, IconPlus, IconUndo, IconVolume } from '../ui/Icon';
+import { IconEffects, IconKeyboard, IconMinus, IconPlus, IconUndo, IconVolume } from '../ui/Icon';
 
 /**
  * 音域分段选择器的选项：档位 = **八度数**（`'1'|'2'|'3'`），或「自定」（逐格步进）。
@@ -87,6 +87,12 @@ export interface PlayModeViewProps {
   /* 声部 */
   voiceMode: 'audio' | 'synth';
   onVoiceModeChange: (mode: 'audio' | 'synth') => void;
+  /**
+   * 打开音色设计面板。**只在「电子音」声部下渲染入口** ——
+   * 采样声部压根不经过合成器，把入口常驻会让人以为它会影响采样音色。
+   * 省略则完全不渲染该按钮。
+   */
+  onOpenSynth?: () => void;
   /** 半音键开关（省略则不渲染该控件） */
   onSemitoneChange?: (on: boolean) => void;
   /* Take 选择器 */
@@ -146,6 +152,7 @@ export default function PlayModeView({
   onPress,
   voiceMode,
   onVoiceModeChange,
+  onOpenSynth,
   onSemitoneChange,
   takes,
   selectedTakeId,
@@ -177,7 +184,7 @@ export default function PlayModeView({
   return (
     <>
       {/* ---- 工具行：单行 26px，全部并列 ---- */}
-      <div className="mb-3 flex flex-wrap items-center gap-2">
+      <div className="mb-3 flex shrink-0 flex-wrap items-center gap-2">
         <span className="text-small text-label-muted">音域</span>
         <Seg
           label="音域"
@@ -280,6 +287,18 @@ export default function PlayModeView({
           ]}
         />
 
+        {voiceMode === 'synth' && onOpenSynth && (
+          <button
+            type="button"
+            onClick={onOpenSynth}
+            title="打开音色设计面板"
+            className="flex h-[26px] items-center gap-1.5 rounded-sm px-2 text-small font-medium text-flame-300 transition-colors hover:bg-ink-800"
+          >
+            <IconEffects size={13} />
+            音色
+          </button>
+        )}
+
         <span aria-hidden="true" className="mx-0.5 h-4 w-px bg-line" />
 
         <button
@@ -350,53 +369,69 @@ export default function PlayModeView({
         </p>
       )}
 
-      {/* ---- 键盘区域（铺满宽度） ---- */}
-      <KeyLayout
-        keyCount={keyCount}
-        keyPitches={keyPitches}
-        /* 半音键收起时**不摆黑键**（键还在数据里，只是不给按） */
-        hideBlackKeys={!semitoneEnabled}
-        renderKey={(i) => {
-          const k = keys[i];
-          if (!k) return null;
-          const isBindingTarget = bindingTarget === i;
-          const boundKey = bindings[i];
-          return (
-            <MemeKey
-              keyIndex={i}
-              label={k.label}
-              /* 黑键由**音高**决定，与半音开关无关：一个键是黑键就永远摆黑键位置 */
-              black={isBlackMidi(keyPitches?.[i] ?? 0)}
-              slotNames={k.sequence.map((r) => r.sampleId ? (nameById.get(r.sampleId) ?? '未知素材') : '未装配')}
-              cursor={cursors[i] ?? 0}
-              interactive={bindingMode || onPress !== undefined}
-              onPress={
-                bindingMode
-                  ? () => {
-                      onBindingTargetChange(i);
-                      return null;
-                    }
-                  : onPress
-                    ? () => onPress(i)
-                    : undefined
-              }
-              extraBadge={bindingMode ? (boundKey ?? (isBindingTarget ? '…' : '')) : undefined}
-              externalFlash={
-                lastFlash?.keyIndex === i
-                  ? { slotIndex: lastFlash.slotIndex, triggered: lastFlash.triggered }
-                  : null
-              }
-              externalPress={lastPress?.keyIndex === i ? lastPress.pressed : undefined}
-            />
-          );
-        }}
-      />
+      {/* ---- 键盘区域（铺满宽度） ----
+          手机端「缩小塞进一屏」：这块是**可伸缩项**，由外层（演奏台的滚动容器）
+          给出可用高度；高度的上下限 = 排数 × (64…96) + 间隙。
+          · 给得少 → 每排等比缩到 64px 为止，排数多也能全塞进一屏；
+          · 给得还不够（低于 64×排数）→ 键区撑住下限，由外层滚动。
+          ⛔ 排数必须与 `KeyLayout` 用**同一个** `octaveGroups` 算，别在这儿自己数。 */}
+      <div
+        className="flex min-h-0 flex-1 flex-col"
+        style={(() => {
+          const rows = octaveRowCount(keyPitches ?? [], keyCount, !semitoneEnabled);
+          const { minH, maxH } = keyAreaHeightRange(rows);
+          return { minHeight: minH, maxHeight: maxH };
+        })()}
+      >
+        <KeyLayout
+          keyCount={keyCount}
+          keyPitches={keyPitches}
+          /* 半音键收起时**不摆黑键**（键还在数据里，只是不给按） */
+          hideBlackKeys={!semitoneEnabled}
+          /* 每排吃满上面给的高度（桌面同理 —— 上限 96 保证与旧版逐像素一致） */
+          fill
+          renderKey={(i) => {
+            const k = keys[i];
+            if (!k) return null;
+            const isBindingTarget = bindingTarget === i;
+            const boundKey = bindings[i];
+            return (
+              <MemeKey
+                keyIndex={i}
+                label={k.label}
+                /* 黑键由**音高**决定，与半音开关无关：一个键是黑键就永远摆黑键位置 */
+                black={isBlackMidi(keyPitches?.[i] ?? 0)}
+                slotNames={k.sequence.map((r) => r.sampleId ? (nameById.get(r.sampleId) ?? '未知素材') : '未装配')}
+                cursor={cursors[i] ?? 0}
+                interactive={bindingMode || onPress !== undefined}
+                onPress={
+                  bindingMode
+                    ? () => {
+                        onBindingTargetChange(i);
+                        return null;
+                      }
+                    : onPress
+                      ? () => onPress(i)
+                      : undefined
+                }
+                extraBadge={bindingMode ? (boundKey ?? (isBindingTarget ? '…' : '')) : undefined}
+                externalFlash={
+                  lastFlash?.keyIndex === i
+                    ? { slotIndex: lastFlash.slotIndex, triggered: lastFlash.triggered }
+                    : null
+                }
+                externalPress={lastPress?.keyIndex === i ? lastPress.pressed : undefined}
+              />
+            );
+          }}
+        />
+      </div>
 
       {/* 提示：弱化到一行，不再独占段落。
           第一段必须描述**键盘此刻实际长什么样**（半音键开着才有深色键），
           不能照着「有没有黑键这个东西」写 —— 收起黑键后说「深色键 = 半音键」
           会让用户满屏找一个根本不存在的深色键。 */}
-      <p className="mt-3 flex items-center justify-center gap-1.5 text-center text-tiny text-label-faint">
+      <p className="mt-3 flex shrink-0 items-center justify-center gap-1.5 text-center text-tiny text-label-faint">
         <IconVolume size={12} />
         {semitoneEnabled && hasBlackKey
           ? '深色键 = 半音键'
