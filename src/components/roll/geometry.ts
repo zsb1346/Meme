@@ -159,23 +159,57 @@ export function laneToY(lane: number, view: ViewState): number {
 }
 
 /**
+ * 事件块宽度（像素）—— `blockSize` 的内核，单独导出供**热路径**调用。
+ *
+ * ⛔ 为什么不能让热路径调 `blockSize`：它返回新对象 `{bw, bh}`。
+ * `hitTest` / `eventsInRect` 每次指针移动都要遍历**全部**事件
+ * （4000 事件的素材 = 每次 mousemove 分配 4000 个对象），全是被丢弃的垃圾。
+ * 这里按值返回，零分配；而 `blockSize` 改成调用它 —— **公式只有这一份**。
+ *
+ * 类型三态：缺省 / 非有限 → `DEFAULT_BLOCK_SEC`；负数 → 0；结果不小于 `MIN_BLOCK_W`。
+ */
+export function blockWidth(pps: number, durationSec?: number): number {
+  const dur =
+    durationSec !== undefined && Number.isFinite(durationSec)
+      ? Math.max(0, durationSec)
+      : DEFAULT_BLOCK_SEC;
+  return Math.max(MIN_BLOCK_W, dur * pps);
+}
+
+/** 事件块高度（像素）：占满行高减 2px 缝，行高很小时退化为 4px 细条 */
+export function blockHeight(rowH: number): number {
+  return Math.max(4, rowH - 2);
+}
+
+/**
+ * 事件的块顶 y —— `laneOf` + `blockTop` 的合体内核（同样为了零分配）。
+ *
+ * ⛔ 必须与 `blockTop(laneOf(ev, keyCount), l, view)` 恒等；
+ * 由 `geometry-equivalence.test.ts` 逐点断言。
+ */
+export function blockTopOfEvent(
+  keyIndex: number,
+  rowH: number,
+  keyCount: number,
+  sy: number,
+): number {
+  const lane = clamp(Math.round(keyIndex), 0, Math.max(1, keyCount) - 1);
+  return RULER_H + lane * rowH - sy + 1;
+}
+
+/**
  * 事件块尺寸（draw 与 hitTest 共用同一公式，保证视觉与命中一致）。
  * 宽度 = 时长 × 时间缩放：横向缩放会真实拉伸块；高度跟行高走。
+ *
+ * 实现委托给 `blockWidth` / `blockHeight`（按值返回的内核）——
+ * 这里只是把它们包成一个对象，**不允许**再写第二份算术。
  */
 export function blockSize(
   rowH: number,
   pps: number,
   durationSec?: number,
 ): { bw: number; bh: number } {
-  const dur =
-    durationSec !== undefined && Number.isFinite(durationSec)
-      ? Math.max(0, durationSec)
-      : DEFAULT_BLOCK_SEC;
-  return {
-    bw: Math.max(MIN_BLOCK_W, dur * pps),
-    // 高度占满行高减去 2px 缝；行高很小时退化为 4px 细条
-    bh: Math.max(4, rowH - 2),
-  };
+  return { bw: blockWidth(pps, durationSec), bh: blockHeight(rowH) };
 }
 
 /** 块的纵向起点（行内留 1px 上边距） */
@@ -388,19 +422,23 @@ export function hitTest(
   l: RollLayout,
 ): HitResult {
   if (x < GUTTER_W || y < RULER_H) return -1;
+  /*
+    ⛔ 热路径：每次指针移动都会跑，而且要扫**全部**事件（没命中时是 O(n)）。
+    因此这里不用 `blockSize` / `blockTop`（各自返回新对象），改用按值返回的内核，
+    并把最便宜的横向判定提到前面 —— 横向落空就直接下一个，连纵向都不算。
+    公式仍是唯一那份（`blockWidth` / `blockTopOfEvent`），见 geometry-equivalence.test.ts。
+  */
+  const { pps, sx, sy } = view;
+  const rowH = l.rowH;
+  const bh = blockHeight(rowH);
+  const pad = BLOCK_PAD_HIT;
   for (let i = events.length - 1; i >= 0; i--) {
     const ev = events[i];
-    const { bw, bh } = blockSize(l.rowH, view.pps, ev.duration);
-    const ex = timeToX(ev.tSec, view);
-    const ey = blockTop(laneOf(ev, l.keyCount), l, view);
-    if (
-      x >= ex - BLOCK_PAD_HIT &&
-      x <= ex + bw + BLOCK_PAD_HIT &&
-      y >= ey - BLOCK_PAD_HIT &&
-      y <= ey + bh + BLOCK_PAD_HIT
-    ) {
-      return i;
-    }
+    const ex = GUTTER_W + ev.tSec * pps - sx;
+    const bw = blockWidth(pps, ev.duration);
+    if (x < ex - pad || x > ex + bw + pad) continue;
+    const ey = blockTopOfEvent(ev.keyIndex, rowH, l.keyCount, sy);
+    if (y >= ey - pad && y <= ey + bh + pad) return i;
   }
   return -1;
 }
@@ -420,9 +458,13 @@ export function hitResizeHandle(
   view: ViewState,
   l: RollLayout,
 ): boolean {
-  const { bw, bh } = blockSize(l.rowH, view.pps, ev.duration);
-  const ex = timeToX(ev.tSec, view);
-  const ey = blockTop(laneOf(ev, l.keyCount), l, view);
+  // 与 hitTest 同源的零分配内核（拖动改时长的热路径）
+  const { pps, sx, sy } = view;
+  const rowH = l.rowH;
+  const bw = blockWidth(pps, ev.duration);
+  const bh = blockHeight(rowH);
+  const ex = GUTTER_W + ev.tSec * pps - sx;
+  const ey = blockTopOfEvent(ev.keyIndex, rowH, l.keyCount, sy);
   // 纵向允许 BLOCK_PAD_HIT 外扩（行很矮时也要能抓住）
   if (y < ey - BLOCK_PAD_HIT || y > ey + bh + BLOCK_PAD_HIT) return false;
   // 块很窄时整个块都算热区，避免完全无法改变时长
@@ -448,14 +490,18 @@ export function eventsInRect(
   const top = Math.min(y0, y1);
   const bottom = Math.max(y0, y1);
   const out: number[] = [];
-  events.forEach((ev, i) => {
-    const { bw, bh } = blockSize(l.rowH, view.pps, ev.duration);
-    const ex = timeToX(ev.tSec, view);
-    const ey = blockTop(laneOf(ev, l.keyCount), l, view);
-    if (ex <= right && ex + bw >= left && ey <= bottom && ey + bh >= top) {
-      out.push(i);
-    }
-  });
+  // 同 hitTest：框选拖动期间每个 pointermove 都跑一遍全量，必须零分配
+  const { pps, sx, sy } = view;
+  const rowH = l.rowH;
+  const bh = blockHeight(rowH);
+  for (let i = 0; i < events.length; i++) {
+    const ev = events[i];
+    const ex = GUTTER_W + ev.tSec * pps - sx;
+    if (ex > right) continue;
+    if (ex + blockWidth(pps, ev.duration) < left) continue;
+    const ey = blockTopOfEvent(ev.keyIndex, rowH, l.keyCount, sy);
+    if (ey <= bottom && ey + bh >= top) out.push(i);
+  }
   return out;
 }
 

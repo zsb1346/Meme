@@ -137,14 +137,42 @@ export function invalidateTokenCache(): void {
 }
 
 /**
+ * `withAlpha` 的结果缓存。
+ *
+ * ⛔ 为什么必须缓存：卷帘每帧要为**每个可见音符块**取 3~5 个半透明变体
+ * （块底暗线 / 顶部高光 / 力度槽 / 力度条 / 选中描边）。高密度画面下这是
+ * 每帧上千次 `正则 exec + parseInt + 模板字符串`，全部是纯浪费 ——
+ * 入参是「令牌色 × 固定 alpha」，**组合数是个位数**。
+ *
+ * ⭐ 更关键的一层收益在调用方：缓存后同一个色值返回**同一个字符串**，
+ * 于是 `ctx.fillStyle = s` 反复赋同一个值时，浏览器有机会直接短路，
+ * 不必每次都重新解析 CSS 颜色（实测 `(program)` 里很大一块就是这个）。
+ * 这一点**依赖字符串复用**，所以缓存值必须原样返回、不能每次新建。
+ *
+ * 上界：键是 `hex|alpha`，真实组合几十个；超过 `CACHE_MAX` 就整体清空重来，
+ * 避免主题反复切换时无限增长（这里是冷路径，清空的代价无所谓）。
+ */
+const ALPHA_CACHE = new Map<string, string>();
+const ALPHA_CACHE_MAX = 256;
+
+/**
  * "#409CFF" + alpha → "rgba(64,156,255,0.55)"，供 canvas 绘制半透明变体。
  * 传入非法 hex 时原样返回（不吞色，便于排查）。
+ *
+ * 结果是**记忆化**的 —— 同一个 `(hex, alpha)` 返回同一个字符串实例，
+ * 见上面 `ALPHA_CACHE` 的说明。
  */
 export function withAlpha(hex: string, alpha: number): string {
+  const key = `${hex}|${alpha}`;
+  const hit = ALPHA_CACHE.get(key);
+  if (hit !== undefined) return hit;
   const m = /^#?([\da-f]{2})([\da-f]{2})([\da-f]{2})$/i.exec(hex.trim());
   if (!m) return hex;
   const r = parseInt(m[1], 16);
   const g = parseInt(m[2], 16);
   const b = parseInt(m[3], 16);
-  return `rgba(${r},${g},${b},${alpha})`;
+  const out = `rgba(${r},${g},${b},${alpha})`;
+  if (ALPHA_CACHE.size >= ALPHA_CACHE_MAX) ALPHA_CACHE.clear();
+  ALPHA_CACHE.set(key, out);
+  return out;
 }
